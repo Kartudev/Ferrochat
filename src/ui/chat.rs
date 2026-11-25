@@ -391,6 +391,15 @@ fn selection_bar<'a>(app: &'a App, sel: &'a crate::app::forward::Selection) -> E
 
 /// The conversation with the info drawer on its right, when open.
 fn with_info<'a>(app: &'a App, conv: &'a Conversation, el: El<'a>) -> El<'a> {
+    if let Some(mi) = app.msg_info.as_ref().filter(|i| i.chat == conv.chat)
+        && let Some(msg) = conv.get(&mi.id)
+    {
+        return row![
+            container(el).width(Length::Fill).height(Length::Fill),
+            super::msg_info::view(app, msg)
+        ]
+        .into();
+    }
     match app.info.as_ref().filter(|i| i.chat == conv.chat) {
         Some(info) => row![
             container(el).width(Length::Fill).height(Length::Fill),
@@ -417,6 +426,7 @@ fn popup_layer<'a>(
             let items = 6
                 + usize::from(msg.can_forward())
                 + usize::from(msg.can_edit(now))
+                + usize::from(msg.from_me)
                 + usize::from(matches!(msg.content, Content::Video { .. }));
             (message_menu(app, msg), 12.0 + 38.0 * items as f32)
         }
@@ -1459,6 +1469,13 @@ fn message_menu<'a>(app: &'a App, msg: &'a ChatMessage) -> El<'a> {
             Icon::Forward,
             "Forward",
             Ui::Forward(Fwd::One(id.clone())),
+        ));
+    }
+    if msg.from_me {
+        col = col.push(item(
+            Icon::Info,
+            "Message info",
+            Ui::MessageInfo(id.clone()),
         ));
     }
     let starred = app.is_starred(&msg.chat, &msg.id);

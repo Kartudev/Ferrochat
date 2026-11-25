@@ -216,9 +216,59 @@ impl WaClient for RealClient {
                 .client
                 .download_from_params(&params)
                 .await
-                .map_err(|e| Error::Net(format!("download failed: {e}")))?;
+                .map_err(|e| {
+                    use whatsapp_rust::ErrorChainExt as _;
+                    // 404 / 410 after the library refreshed its media
+                    // connection: the blob is gone from the CDN.
+                    let chain: &(dyn std::error::Error + Send + Sync + 'static) = e.as_ref();
+                    if matches!(chain.http_status(), Some(404 | 410)) {
+                        Error::MediaExpired
+                    } else {
+                        Error::Net(format!("download failed: {e}"))
+                    }
+                })?;
             crate::media::check_download_size(bytes.len() as u64)?;
             Ok(bytes)
+        })
+    }
+
+    fn reupload<'a>(
+        &'a self,
+        key: &'a MsgKey,
+        media: &'a MediaRef,
+    ) -> BoxFuture<'a, Result<MediaRef>> {
+        Box::pin(async move {
+            use whatsapp_rust::{MediaRetryResult, MediaReuploadRequest};
+            let chat = parse_jid(&key.chat)?;
+            // Groups name the author; a direct chat is the author itself.
+            let participant = if super::is_group_jid(&key.chat) && !key.from_me {
+                Some(parse_jid(&key.sender)?)
+            } else {
+                None
+            };
+            let result = self
+                .client
+                .media_reupload()
+                .request(&MediaReuploadRequest {
+                    msg_id: &key.id,
+                    chat_jid: &chat,
+                    media_key: &media.media_key,
+                    is_from_me: key.from_me,
+                    participant: participant.as_ref(),
+                })
+                .await
+                .map_err(|e| Error::Net(format!("media re-upload failed: {e}")))?;
+            match result {
+                MediaRetryResult::Success { direct_path } => Ok(MediaRef {
+                    direct_path,
+                    ..media.clone()
+                }),
+                MediaRetryResult::NotFound => Err(Error::MediaGone("not found".into())),
+                MediaRetryResult::DecryptionError => {
+                    Err(Error::MediaGone("decryption error".into()))
+                }
+                MediaRetryResult::GeneralError => Err(Error::MediaGone("general error".into())),
+            }
         })
     }
 
@@ -1458,6 +1508,7 @@ fn translate(ev: &WaEvent, client: &Client, attempt: &mut u32) -> Vec<Event> {
                         .source
                         .is_group
                         .then(|| convert::bare_jid(&r.source.sender.to_string())),
+                    timestamp: r.timestamp.timestamp(),
                 }],
                 None => vec![],
             }

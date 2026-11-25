@@ -145,12 +145,15 @@ pub enum Icon {
     VideoOff,
     /// `forward`
     Forward,
+    /// `info`
+    Info,
 }
 
 impl Icon {
     fn bytes(self) -> &'static [u8] {
         match self {
             Icon::Archive => include_bytes!("../../assets/icons/archive.svg"),
+            Icon::Info => include_bytes!("../../assets/icons/info.svg"),
             Icon::ZoomIn => include_bytes!("../../assets/icons/zoom-in.svg"),
             Icon::ZoomOut => include_bytes!("../../assets/icons/zoom-out.svg"),
             Icon::Ban => include_bytes!("../../assets/icons/ban.svg"),

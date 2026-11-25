@@ -193,6 +193,7 @@ impl App {
             return Task::none();
         }
         self.popup = None;
+        self.msg_info = None;
         self.info = Some(InfoPanel::new(chat.clone()));
         let group = net::is_group_jid(&chat);
         let done = |d: InfoDone| Message::done(Done::Info(Box::new(d)));

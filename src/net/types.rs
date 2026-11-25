@@ -231,6 +231,18 @@ impl Content {
         }
     }
 
+    /// Mutable access to the media reference (a re-upload moves it).
+    pub fn media_mut(&mut self) -> Option<&mut MediaRef> {
+        match self {
+            Content::Image { media, .. }
+            | Content::Document { media, .. }
+            | Content::Video { media, .. }
+            | Content::Sticker { media, .. }
+            | Content::Voice { media, .. } => media.as_mut(),
+            _ => None,
+        }
+    }
+
     /// The downloadable media of this content, if any.
     pub fn media(&self) -> Option<&MediaRef> {
         match self {

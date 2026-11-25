@@ -57,8 +57,19 @@ pub trait WaClient: Send + Sync {
         id: &'a str,
         source: &'a Message,
     ) -> BoxFuture<'a, Result<()>>;
-    /// Downloads and decrypts a media blob.
+    /// Downloads and decrypts a media blob. `Error::MediaExpired` when the
+    /// CDN no longer has it (see [`reupload`](Self::reupload)).
     fn download<'a>(&'a self, media: &'a MediaRef) -> BoxFuture<'a, Result<Vec<u8>>>;
+    /// Asks for expired media of message `key` to be uploaded again (the
+    /// "media retry" receipt WhatsApp sends: the phone that has the file
+    /// re-uploads it). `key` carries the JIDs the message came from (LIDs
+    /// included). Returns `media` with the new path; `Error::MediaGone` when
+    /// nobody has it any more.
+    fn reupload<'a>(
+        &'a self,
+        key: &'a MsgKey,
+        media: &'a MediaRef,
+    ) -> BoxFuture<'a, Result<MediaRef>>;
     /// Sends read receipts. `sender` is required for group messages.
     fn mark_read<'a>(
         &'a self,
@@ -305,6 +316,8 @@ pub enum Event {
         status: ReceiptStatus,
         /// Who the receipt is from (groups only).
         participant: Option<String>,
+        /// When it was sent (Unix seconds); 0 = unknown (local states).
+        timestamp: i64,
     },
     /// A reaction was added, changed or removed (`emoji` empty).
     Reaction {

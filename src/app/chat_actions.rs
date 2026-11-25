@@ -389,6 +389,7 @@ impl App {
         if self.open.as_ref().is_some_and(|c| c.chat == chat) {
             self.open = None;
             self.info = None;
+            self.msg_info = None;
             self.popup = None;
             self.dialog = None;
             self.reply_to = None;

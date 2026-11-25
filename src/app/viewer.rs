@@ -151,10 +151,9 @@ impl App {
         self.popup = None;
         self.emoji_open = false;
         self.viewer = Some(ImageViewer::new(id.clone()));
-        let Some(mref) = self
+        let Some((mref, origin)) = self
             .find_message(&id)
-            .and_then(|m| m.content.media())
-            .cloned()
+            .and_then(|m| m.content.media().map(|r| (r.clone(), self.media_origin(m))))
         else {
             return Task::none();
         };
@@ -167,7 +166,7 @@ impl App {
         let max = crate::media::MAX_IMAGE_PIXELS;
         Task::perform(
             async move {
-                let bytes = client.download(&mref).await.map_err(|e| e.to_string())?;
+                let bytes = super::media_fetch::download(&client, &mref, Some(&origin)).await?;
                 // Header-only probe: refuse decompression bombs before iced
                 // decodes the picture.
                 tokio::task::spawn_blocking(move || {

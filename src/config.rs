@@ -65,6 +65,10 @@ pub enum ScreenshotTarget {
     AttachGif,
     /// Files dragged over the open conversation.
     Drop,
+    /// "Message info" of one of our messages in a direct chat.
+    MessageInfo,
+    /// "Message info" of one of our messages in a group.
+    GroupMessageInfo,
     /// Conversation with the emoji drawer open.
     Emoji,
     /// The full-size image viewer.
@@ -153,6 +157,8 @@ impl ScreenshotTarget {
             "attach-video" => Some(Self::AttachVideo),
             "attach-gif" => Some(Self::AttachGif),
             "drop" => Some(Self::Drop),
+            "message-info" => Some(Self::MessageInfo),
+            "group-message-info" => Some(Self::GroupMessageInfo),
             "emoji" | "emoji-picker" => Some(Self::Emoji),
             "viewer" | "image-viewer" => Some(Self::Viewer),
             "info" | "contact-info" => Some(Self::Info),

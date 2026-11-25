@@ -12,7 +12,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::error::{Error, Result};
 use crate::net::types::{
-    ChatFlag, ChatMeta, Content, ListDef, ListKind, Message, NameSource, ReceiptStatus,
+    ChatFlag, ChatMeta, Content, ListDef, ListKind, MediaRef, Message, NameSource, ReceiptStatus,
 };
 
 const MIGRATIONS: &[&str] = &[
@@ -24,6 +24,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("migration_6.sql"),
     include_str!("migration_7.sql"),
     include_str!("migration_8.sql"),
+    include_str!("migration_9.sql"),
 ];
 
 mod social;
@@ -317,6 +318,21 @@ impl Store {
 
     /// Replaces a message's content (e.g. after a media upload filled in
     /// the CDN reference) and/or status.
+    /// Points a cached message at re-uploaded media (new `directPath`).
+    /// `false` when the message is not cached or has no media.
+    pub fn set_media_ref(&self, chat: &str, id: &str, media: &MediaRef) -> Result<bool> {
+        let Some(m) = self.message(chat, id)? else {
+            return Ok(false);
+        };
+        let mut content = m.content;
+        let Some(slot) = content.media_mut() else {
+            return Ok(false);
+        };
+        *slot = media.clone();
+        self.update_message(chat, id, &content)?;
+        Ok(true)
+    }
+
     pub fn update_message(&self, chat: &str, id: &str, content: &Content) -> Result<()> {
         let (json, thumb) = encode_content(content)?;
         self.lock()?.execute(
@@ -523,6 +539,10 @@ impl Store {
             params![chat],
         )?;
         tx.execute(
+            &format!("DELETE FROM receipt_times WHERE chat_id = ?1{keep_ref}"),
+            params![chat],
+        )?;
+        tx.execute(
             &format!("DELETE FROM messages WHERE chat_id = ?1{keep}"),
             params![chat],
         )?;
@@ -542,6 +562,7 @@ impl Store {
         for sql in [
             "DELETE FROM reactions WHERE chat_id = ?1",
             "DELETE FROM receipts WHERE chat_id = ?1",
+            "DELETE FROM receipt_times WHERE chat_id = ?1",
             "DELETE FROM messages WHERE chat_id = ?1",
             "DELETE FROM starred WHERE chat_id = ?1",
             "DELETE FROM chats WHERE id = ?1",
@@ -672,7 +693,7 @@ impl Store {
     pub fn clear(&self) -> Result<()> {
         self.lock()?.execute_batch(
             "DELETE FROM messages; DELETE FROM chats; DELETE FROM contact_names; DELETE FROM kv;
-             DELETE FROM lid_map; DELETE FROM reactions; DELETE FROM receipts;
+             DELETE FROM lid_map; DELETE FROM reactions; DELETE FROM receipts; DELETE FROM receipt_times;
              DELETE FROM lists; DELETE FROM list_chats; DELETE FROM statuses; DELETE FROM starred;",
         )?;
         Ok(())
@@ -751,6 +772,7 @@ impl Store {
             "DELETE FROM messages WHERE chat_id = ?1 AND id = ?2",
             "DELETE FROM reactions WHERE chat_id = ?1 AND msg_id = ?2",
             "DELETE FROM receipts WHERE chat_id = ?1 AND msg_id = ?2",
+            "DELETE FROM receipt_times WHERE chat_id = ?1 AND msg_id = ?2",
         ] {
             tx.execute(sql, params![chat, id])?;
         }
@@ -928,6 +950,85 @@ impl Store {
         Ok(changed)
     }
 
+    /// Records when a delivered / read / played receipt of our messages
+    /// arrived (`participant` is `""` in direct chats). The first time of
+    /// each step wins; other people's messages are skipped.
+    pub fn record_receipt_times(
+        &self,
+        chat: &str,
+        ids: &[String],
+        participant: &str,
+        status: ReceiptStatus,
+        ts: i64,
+    ) -> Result<()> {
+        if !matches!(
+            status,
+            ReceiptStatus::Delivered | ReceiptStatus::Read | ReceiptStatus::Played
+        ) {
+            return Ok(());
+        }
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        {
+            let mut ins = tx.prepare_cached(
+                "INSERT OR IGNORE INTO receipt_times (chat_id, msg_id, participant, status, ts)
+                 SELECT ?1, ?2, ?3, ?4, ?5
+                 WHERE EXISTS (SELECT 1 FROM messages
+                               WHERE chat_id = ?1 AND id = ?2 AND from_me = 1)",
+            )?;
+            for id in ids {
+                ins.execute(params![chat, id, participant, status.to_i64(), ts])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Everything known about who received / read one of our messages:
+    /// one row per participant (`""` in direct chats) with its furthest
+    /// status and the time of each step, when it was seen arriving.
+    pub fn receipt_details(&self, chat: &str, id: &str) -> Result<Vec<ReceiptDetail>> {
+        let conn = self.lock()?;
+        let mut out: std::collections::BTreeMap<String, ReceiptDetail> = Default::default();
+        let mut times = conn.prepare_cached(
+            "SELECT participant, status, ts FROM receipt_times WHERE chat_id = ?1 AND msg_id = ?2",
+        )?;
+        let rows = times.query_map(params![chat, id], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                ReceiptStatus::from_i64(r.get(1)?),
+                r.get::<_, i64>(2)?,
+            ))
+        })?;
+        for row in rows {
+            let (p, status, ts) = row?;
+            let d = out
+                .entry(p.clone())
+                .or_insert_with(|| ReceiptDetail::new(p));
+            d.status = d.status.advance(status);
+            match status {
+                ReceiptStatus::Delivered => d.delivered = Some(ts),
+                ReceiptStatus::Read => d.read = Some(ts),
+                ReceiptStatus::Played => d.played = Some(ts),
+                _ => {}
+            }
+        }
+        let mut st = conn.prepare_cached(
+            "SELECT participant, status FROM receipts WHERE chat_id = ?1 AND msg_id = ?2",
+        )?;
+        let rows = st.query_map(params![chat, id], |r| {
+            Ok((r.get::<_, String>(0)?, ReceiptStatus::from_i64(r.get(1)?)))
+        })?;
+        for row in rows {
+            let (p, status) = row?;
+            let d = out
+                .entry(p.clone())
+                .or_insert_with(|| ReceiptDetail::new(p));
+            d.status = d.status.advance(status);
+        }
+        Ok(out.into_values().collect())
+    }
+
     /// Per-participant receipts of a message: `(participant, status)`.
     pub fn receipts_of(&self, chat: &str, id: &str) -> Result<Vec<(String, ReceiptStatus)>> {
         let conn = self.lock()?;
@@ -941,6 +1042,31 @@ impl Store {
             })?
             .collect::<std::result::Result<_, _>>()?;
         Ok(rows)
+    }
+}
+
+/// One participant's receipts of one of our messages ([`Store::receipt_details`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReceiptDetail {
+    /// Bare JID, `""` in direct chats.
+    pub participant: String,
+    /// Furthest step seen.
+    pub status: ReceiptStatus,
+    /// Unix seconds of each step, when its receipt was seen arriving.
+    pub delivered: Option<i64>,
+    pub read: Option<i64>,
+    pub played: Option<i64>,
+}
+
+impl ReceiptDetail {
+    fn new(participant: String) -> Self {
+        Self {
+            participant,
+            status: ReceiptStatus::Sent,
+            delivered: None,
+            read: None,
+            played: None,
+        }
     }
 }
 
@@ -1168,6 +1294,44 @@ mod tests {
         assert_eq!(s.chat_rows().unwrap()[0].last.as_ref().unwrap().id, "2");
         assert!(decode_mentions("not json").is_empty());
         assert_eq!(encode_mentions(&[]), None);
+    }
+
+    #[test]
+    fn a_reuploaded_media_path_is_kept() {
+        let s = Store::open_in_memory().unwrap();
+        let mref = MediaRef {
+            direct_path: "/old".into(),
+            media_key: vec![1; 32],
+            file_sha256: vec![2; 32],
+            file_enc_sha256: vec![3; 32],
+            file_length: 10,
+            kind: crate::net::MediaKind::Image,
+            mimetype: "image/jpeg".into(),
+        };
+        let mut m = msg("c", "p", 10, false, "");
+        m.content = Content::Image {
+            caption: Some("hi".into()),
+            width: 4,
+            height: 3,
+            thumbnail: Some(vec![7]),
+            media: Some(mref.clone()),
+        };
+        s.insert_messages(&[m]).unwrap();
+        let fresh = MediaRef {
+            direct_path: "/new".into(),
+            ..mref
+        };
+        assert!(s.set_media_ref("c", "p", &fresh).unwrap());
+        let got = s.message("c", "p").unwrap().unwrap();
+        assert_eq!(got.content.media(), Some(&fresh));
+        assert!(matches!(
+            got.content,
+            Content::Image { thumbnail: Some(ref t), caption: Some(_), .. } if t == &[7]
+        ));
+        assert!(!s.set_media_ref("c", "missing", &fresh).unwrap());
+        s.insert_messages(&[msg("c", "t", 11, false, "text")])
+            .unwrap();
+        assert!(!s.set_media_ref("c", "t", &fresh).unwrap());
     }
 
     #[test]

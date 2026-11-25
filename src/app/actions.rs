@@ -1101,6 +1101,7 @@ impl App {
         let Some(m) = self.find_message(id).cloned() else {
             return Task::none();
         };
+        let origin = self.media_origin(&m);
         let Content::Video {
             media: Some(mref), ..
         } = m.content
@@ -1122,7 +1123,7 @@ impl App {
             async move {
                 let path = dir.join(&name);
                 if !path.is_file() {
-                    let bytes = client.download(&mref).await.map_err(|e| e.to_string())?;
+                    let bytes = super::media_fetch::download(&client, &mref, Some(&origin)).await?;
                     let (d, p) = (dir.clone(), path.clone());
                     tokio::task::spawn_blocking(move || {
                         crate::config::secure_dir(&d).map_err(|e| e.to_string())?;

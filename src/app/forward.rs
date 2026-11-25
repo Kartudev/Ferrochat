@@ -9,6 +9,9 @@
 //! every target chat and is sent in order, one message after the other.
 //! Media is relayed from the same CDN blob (`WaClient::forward`).
 
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+
 use iced::Task;
 
 use super::message::{Done, Message, Ui};
@@ -21,6 +24,16 @@ pub const FORWARD_SEARCH_ID: &str = "forward-search";
 
 /// Most chats one forward can go to.
 pub const MAX_FORWARD_CHATS: usize = 5;
+
+/// Media older than this is re-uploaded before it is forwarded: the copy
+/// relays the CDN blob, and old blobs are often gone (recipients would get
+/// a broken download). An estimate; the CDN does not say when it drops one.
+pub const STALE_MEDIA_SECS: i64 = 14 * 24 * 3600;
+
+/// Whether `msg`'s media should be refreshed before forwarding it.
+pub fn needs_fresh_media(msg: &ChatMessage, now: i64) -> bool {
+    msg.content.media().is_some() && now - msg.timestamp > STALE_MEDIA_SECS
+}
 
 /// Messages picked in a conversation ("Select messages").
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -263,6 +276,14 @@ impl App {
             return Task::none();
         }
         self.selection = None;
+        let now = chrono::Utc::now().timestamp();
+        // Stale media is re-uploaded once per source, before its first copy.
+        let origins: HashMap<String, super::media_fetch::MediaOrigin> = d
+            .msgs
+            .iter()
+            .filter(|m| needs_fresh_media(m, now))
+            .map(|m| (m.id.clone(), self.media_origin(m)))
+            .collect();
         let mut jobs: Vec<(ChatId, String, ChatMessage)> = Vec::new();
         let mut locals: Vec<ChatMessage> = Vec::new();
         for chat in &d.targets {
@@ -286,9 +307,44 @@ impl App {
         };
         // One after the other, so the copies arrive in order.
         use futures::StreamExt;
-        let sends = futures::stream::iter(jobs).then(move |(chat, id, src)| {
+        let refreshed: Arc<Mutex<HashMap<String, net::MediaRef>>> = Arc::default();
+        let (store, fresh_media) = (self.store.clone(), self.fresh_media.clone());
+        let sends = futures::stream::iter(jobs).then(move |(chat, id, mut src)| {
             let client = client.clone();
+            let origin = origins.get(&src.id).cloned();
+            let refreshed = refreshed.clone();
+            let (store, fresh_media) = (store.clone(), fresh_media.clone());
             async move {
+                if let Some(origin) = origin {
+                    let known = refreshed.lock().ok().and_then(|r| r.get(&src.id).cloned());
+                    let fresh = match known {
+                        Some(f) => Some(f),
+                        None => match src.content.media() {
+                            // Best effort: when the phone no longer has the
+                            // file the old blob is relayed as before.
+                            Some(old) => super::media_fetch::reupload(&client, old, &origin)
+                                .await
+                                .ok(),
+                            None => None,
+                        },
+                    };
+                    if let Some(f) = fresh {
+                        if let Ok(mut r) = refreshed.lock() {
+                            r.insert(src.id.clone(), f.clone());
+                        }
+                        if let Some(slot) = src.content.media_mut() {
+                            *slot = f.clone();
+                        }
+                        // Our copy points at the fresh blob too.
+                        if let Ok(mut m) = fresh_media.lock() {
+                            m.insert((chat.clone(), id.clone()), f.clone());
+                        }
+                        let (c, i) = (chat.clone(), id.clone());
+                        let _ =
+                            tokio::task::spawn_blocking(move || store.set_media_ref(&c, &i, &f))
+                                .await;
+                    }
+                }
                 let result = client
                     .forward(&chat, &id, &src)
                     .await

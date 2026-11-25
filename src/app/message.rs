@@ -134,6 +134,10 @@ pub enum Ui {
     ToggleInfo,
     /// Close the info drawer.
     CloseInfo,
+    /// "Message info" from the menu of one of our messages.
+    MessageInfo(String),
+    /// Close the "Message info" panel.
+    CloseMessageInfo,
     /// Open a gallery tab of the info drawer (`None` = back).
     InfoGallery(Option<crate::app::info::Tab>),
     /// Mute / unmute a chat.
@@ -527,6 +531,12 @@ pub enum Done {
     },
     /// An info drawer query finished.
     Info(Box<crate::app::info::InfoDone>),
+    /// The receipts of the "Message info" panel were read.
+    MsgInfo {
+        chat: String,
+        id: String,
+        rows: Vec<crate::store::ReceiptDetail>,
+    },
     /// A photo was saved / handed to the system viewer (`None` = cancelled).
     ViewerSaved(Result<Option<PathBuf>, String>),
     /// Voice note downloaded and decoded.

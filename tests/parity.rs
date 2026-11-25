@@ -133,6 +133,7 @@ impl Driver {
                 ids,
                 status,
                 participant: Some(p),
+                ..
             } => {
                 let changed = self
                     .store

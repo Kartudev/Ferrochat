@@ -65,6 +65,11 @@ impl Default for FakeOptions {
 /// A recorded outgoing action.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Sent {
+    /// A media re-upload request.
+    Reupload {
+        /// Message id.
+        id: String,
+    },
     /// A forwarded message.
     Forward {
         /// Target chat.
@@ -284,6 +289,8 @@ pub struct FakeClient {
     own_jid: String,
     log: Mutex<Vec<Sent>>,
     media: Mutex<HashMap<String, Vec<u8>>>,
+    /// Media whose CDN copy "expired": served again after a re-upload.
+    expired: Mutex<HashMap<String, Vec<u8>>>,
     avatars: HashMap<String, Vec<u8>>,
     pending_pair: Mutex<Option<(Vec<Event>, Vec<Message>)>>,
     resync_reports: Mutex<std::collections::VecDeque<ResyncReport>>,
@@ -301,6 +308,21 @@ impl FakeClient {
     /// Everything the app asked the fake to do, in order.
     pub fn log(&self) -> Vec<Sent> {
         self.log.lock().map(|l| l.clone()).unwrap_or_default()
+    }
+
+    /// Makes the media at `direct_path` expire: downloads fail with
+    /// `MediaExpired` until it is re-uploaded. `gone` = nobody has it.
+    pub fn expire_media(&self, direct_path: &str, gone: bool) {
+        let bytes = self
+            .media
+            .lock()
+            .ok()
+            .and_then(|mut m| m.remove(direct_path));
+        if let (Some(b), false, Ok(mut e)) = (bytes, gone, self.expired.lock()) {
+            e.insert(direct_path.to_string(), b);
+        } else if gone && let Ok(mut e) = self.expired.lock() {
+            e.insert(direct_path.to_string(), Vec::new());
+        }
     }
 
     fn record(&self, s: Sent) {
@@ -471,6 +493,7 @@ impl FakeClient {
             ids: ids.iter().map(|s| s.to_string()).collect(),
             status,
             participant: Some(participant.into()),
+            timestamp: 0,
         });
     }
 
@@ -485,6 +508,7 @@ impl FakeClient {
             ids: ids.clone(),
             status: ReceiptStatus::Sent,
             participant: None,
+            timestamp: 0,
         });
         if !auto || crate::net::is_group_jid(&chat) {
             // Group receipts come per participant; tests drive them.
@@ -497,6 +521,7 @@ impl FakeClient {
                 ids: ids.clone(),
                 status: ReceiptStatus::Delivered,
                 participant: None,
+                timestamp: 0,
             });
             tokio::time::sleep(delay).await;
             let _ = tx.send(Event::Receipt {
@@ -504,6 +529,7 @@ impl FakeClient {
                 ids,
                 status: ReceiptStatus::Read,
                 participant: None,
+                timestamp: 0,
             });
         });
     }
@@ -636,11 +662,43 @@ impl WaClient for FakeClient {
 
     fn download<'a>(&'a self, media: &'a MediaRef) -> BoxFuture<'a, Result<Vec<u8>>> {
         Box::pin(async move {
+            if self
+                .expired
+                .lock()
+                .is_ok_and(|e| e.contains_key(&media.direct_path))
+            {
+                return Err(Error::MediaExpired);
+            }
             self.media
                 .lock()
                 .ok()
                 .and_then(|m| m.get(&media.direct_path).cloned())
                 .ok_or_else(|| Error::Net("media not found (404)".into()))
+        })
+    }
+
+    fn reupload<'a>(
+        &'a self,
+        key: &'a MsgKey,
+        media: &'a MediaRef,
+    ) -> BoxFuture<'a, Result<MediaRef>> {
+        Box::pin(async move {
+            self.record(Sent::Reupload { id: key.id.clone() });
+            let bytes = self
+                .expired
+                .lock()
+                .ok()
+                .and_then(|mut e| e.remove(&media.direct_path))
+                .filter(|b| !b.is_empty())
+                .ok_or_else(|| Error::MediaGone("not found".into()))?;
+            let direct_path = format!("{}-re", media.direct_path);
+            if let Ok(mut m) = self.media.lock() {
+                m.insert(direct_path.clone(), bytes);
+            }
+            Ok(MediaRef {
+                direct_path,
+                ..media.clone()
+            })
         })
     }
 
@@ -1214,6 +1272,7 @@ pub fn start(
         own_jid: data.own_jid.clone(),
         log: Mutex::new(Vec::new()),
         media: Mutex::new(data.media),
+        expired: Mutex::new(HashMap::new()),
         avatars: data.avatars,
         pending_pair: Mutex::new(None),
         resync_reports: Mutex::new(std::collections::VecDeque::new()),

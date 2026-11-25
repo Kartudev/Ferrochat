@@ -64,6 +64,10 @@ automatic check off in Settings; it only asks GitHub for the latest release.
 |---|---|---|
 | ![](docs/screenshots/attach-video.png) | ![](docs/screenshots/attach-gif.png) | ![](docs/screenshots/drop.png) |
 
+| Message info | Message info in a group |
+|---|---|
+| ![](docs/screenshots/message-info.png) | ![](docs/screenshots/group-message-info.png) |
+
 ## Features
 
 * QR-code pairing as a linked device (codes refresh automatically, reload
@@ -94,6 +98,10 @@ automatic check off in Settings; it only asks GitHub for the latest release.
   loop) and stickers
   (WebP, static; animated ones show their first frame).
 * Group ticks turn blue only once every participant has read the message.
+* Message info for your messages: when it was delivered, read or played,
+  and in groups who has read it and who has only received it.
+* Old media whose server copy has expired is re-requested from the sender's
+  phone and downloaded again (also before forwarding old media).
 * Desktop notifications (sender + preview, or sender only).
 
 See [docs/protocol.md](docs/protocol.md) for what works, what is stored on

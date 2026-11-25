@@ -231,6 +231,7 @@ impl App {
         let Some(m) = self.find_message(id).cloned() else {
             return Task::none();
         };
+        let origin = self.media_origin(&m);
         let Content::Video { media, gif, .. } = m.content else {
             return Task::none();
         };
@@ -250,12 +251,15 @@ impl App {
         self.popup = None;
         let dir = self.video_dir();
         let session = id.to_string();
-        Task::perform(fetch_video_file(client, mref, dir), move |result| {
-            Message::done(Done::VideoFile {
-                id: session,
-                result,
-            })
-        })
+        Task::perform(
+            fetch_video_file(client, mref, dir, Some(origin)),
+            move |result| {
+                Message::done(Done::VideoFile {
+                    id: session,
+                    result,
+                })
+            },
+        )
     }
 
     /// Videos in the open chat that came without an inline thumbnail get a
@@ -270,7 +274,7 @@ impl App {
         let Some(client) = self.client.clone() else {
             return Task::none();
         };
-        let Some((chat, id, mref)) = self.open.as_ref().and_then(|c| {
+        let Some((chat, id, mref, origin)) = self.open.as_ref().and_then(|c| {
             c.messages
                 .iter()
                 .rev()
@@ -286,7 +290,12 @@ impl App {
                         self.posters_tried.contains(&m.id),
                     ) =>
                     {
-                        Some((m.chat.clone(), m.id.clone(), r.clone()))
+                        Some((
+                            m.chat.clone(),
+                            m.id.clone(),
+                            r.clone(),
+                            self.media_origin(m),
+                        ))
                     }
                     _ => None,
                 })
@@ -305,7 +314,7 @@ impl App {
         let dir = scratch.clone().unwrap_or_else(|| self.video_dir());
         Task::perform(
             async move {
-                let path = fetch_video_file(client, mref, dir).await;
+                let path = fetch_video_file(client, mref, dir, Some(origin)).await;
                 let frame = match &path {
                     Ok(p) => {
                         crate::media::video::first_frame(p, std::time::Duration::from_secs(15))
@@ -522,13 +531,14 @@ pub(super) async fn fetch_video_file(
     client: crate::net::ClientHandle,
     mref: crate::net::MediaRef,
     dir: std::path::PathBuf,
+    origin: Option<super::media_fetch::MediaOrigin>,
 ) -> Result<std::path::PathBuf, String> {
     use crate::media::avatar;
     let ext = super::actions::video_extension(&mref.mimetype);
     let name = format!("{}.{ext}", avatar::name_hash(&mref.cache_key()));
     let path = dir.join(&name);
     if !path.is_file() {
-        let bytes = client.download(&mref).await.map_err(|e| e.to_string())?;
+        let bytes = super::media_fetch::download(&client, &mref, origin.as_ref()).await?;
         let (d, p) = (dir.clone(), path.clone());
         tokio::task::spawn_blocking(move || {
             crate::config::secure_dir(&d).map_err(|e| e.to_string())?;

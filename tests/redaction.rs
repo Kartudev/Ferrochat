@@ -106,7 +106,7 @@ fn logs_do_not_leak_secrets() {
             e3 = ?Event::ChatState { chat: jid.clone(), participant: Some(jid.clone()), state: ChatState::Composing },
             e4 = ?Event::Presence { jid: jid.clone(), online: true, last_seen: Some(5) },
             e5 = ?Event::PictureChanged { jid: jid.clone() },
-            e6 = ?Event::Receipt { chat: jid.clone(), ids: vec!["ID1".into()], status: ReceiptStatus::Read, participant: Some(jid.clone()) },
+            e6 = ?Event::Receipt { chat: jid.clone(), ids: vec!["ID1".into()], status: ReceiptStatus::Read, participant: Some(jid.clone()), timestamp: 0 },
             e7 = ?Event::DeletedForMe { chat: jid.clone(), id: "ID1".into() },
             "net events"
         );

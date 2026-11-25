@@ -9,6 +9,7 @@ pub mod icons;
 pub mod info;
 pub mod login;
 pub mod measure;
+pub mod msg_info;
 pub mod nav;
 pub mod settings;
 pub mod sidebar;
