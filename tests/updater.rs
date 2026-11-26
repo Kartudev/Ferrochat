@@ -154,7 +154,7 @@ fn release_json(base: &str) -> Vec<u8> {
     let name = archive_name();
     format!(
         r#"{{"tag_name":"v{VERSION}","draft":false,"prerelease":false,
-        "html_url":"https://github.com/FerroApps/Ferrochat/releases/tag/v{VERSION}",
+        "html_url":"https://github.com/Kartudev/Ferrochat-kartu/releases/tag/v{VERSION}",
         "assets":[
           {{"name":"{name}","browser_download_url":"{base}/dl/{name}","size":0}},
           {{"name":"{name}.sha256","browser_download_url":"{base}/dl/{name}.sha256","size":0}}

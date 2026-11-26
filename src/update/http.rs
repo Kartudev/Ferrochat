@@ -314,10 +314,10 @@ mod tests {
         let p = Policy::github();
         let ok = |s: &str| p.allows(&Url::parse(s).unwrap());
         assert!(ok(
-            "https://api.github.com/repos/FerroApps/Ferrochat/releases/latest"
+            "https://api.github.com/repos/Kartudev/Ferrochat-kartu/releases/latest"
         ));
         assert!(ok(
-            "https://github.com/FerroApps/Ferrochat/releases/download/v1.0.0/x.tar.gz"
+            "https://github.com/Kartudev/Ferrochat-kartu/releases/download/v1.0.0/x.tar.gz"
         ));
         assert!(ok("https://objects.githubusercontent.com/a/b?sig=1"));
         assert!(ok("https://release-assets.githubusercontent.com/a/b?sig=1"));

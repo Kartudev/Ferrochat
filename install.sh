@@ -1,8 +1,8 @@
 #!/bin/sh
 # Ferrochat installer / updater (Linux x86_64, no root needed).
 #
-#   curl -fsSL https://raw.githubusercontent.com/FerroApps/Ferrochat/main/install.sh | sh
-#   curl -fsSL https://raw.githubusercontent.com/FerroApps/Ferrochat/main/install.sh | sh -s -- --uninstall
+#   curl -fsSL https://raw.githubusercontent.com/Kartudev/Ferrochat-kartu/main/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/Kartudev/Ferrochat-kartu/main/install.sh | sh -s -- --uninstall
 #
 # The same command installs and updates: it downloads the latest GitHub
 # Release, verifies its SHA-256 checksum and installs into the user's home:
@@ -18,7 +18,7 @@
 
 set -eu
 
-REPO="FerroApps/Ferrochat"
+REPO="Kartudev/Ferrochat-kartu"
 CRATE="ferrochat"
 APP_ID="dev.ferro.ferrochat"
 APP_NAME="Ferrochat"
