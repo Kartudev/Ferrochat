@@ -134,6 +134,7 @@ async fn a_missing_file_fails_cleanly() {
 }
 
 /// Writes an executable shell script acting as the helper.
+#[cfg(unix)]
 fn script(dir: &Path, body: &str) -> PathBuf {
     use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
@@ -153,6 +154,7 @@ fn script(dir: &Path, body: &str) -> PathBuf {
 /// `spawn_with` for scripted helpers. Another test thread can fork while our
 /// script's write fd is still open, which makes exec fail with ETXTBSY (os
 /// error 26) for a moment; retry that only, here and not in production.
+#[cfg(unix)]
 fn spawn_script(helper: &Path, file: &Path) -> Result<(Player, UnboundedReceiver<Event>), Failure> {
     let mut last = None;
     for _ in 0..20 {
@@ -168,6 +170,7 @@ fn spawn_script(helper: &Path, file: &Path) -> Result<(Player, UnboundedReceiver
 }
 
 #[tokio::test]
+#[cfg(unix)]
 async fn player_parses_helper_output_and_delivers_commands() {
     let dir = tmp("script");
     // Ready(2x1, 1000 ms), a 2x1 frame, a time message, then record stdin.
@@ -217,6 +220,7 @@ cat > "$1.cmds""#,
 }
 
 #[tokio::test]
+#[cfg(unix)]
 async fn a_helper_the_loader_refuses_is_reported_with_the_loader_message() {
     let dir = tmp("noloader");
     let helper = script(

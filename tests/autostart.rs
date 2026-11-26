@@ -1,6 +1,8 @@
 //! Autostart entry creation and removal through the environment-driven API
 //! (`XDG_CONFIG_HOME`). One test only: it mutates the process environment.
 
+#![cfg(not(windows))]
+
 use ferrochat::autostart;
 
 #[test]

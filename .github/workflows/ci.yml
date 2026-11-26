@@ -47,3 +47,55 @@ jobs:
           FERRO_REAL_KEYRING: "1"
         run: |
           dbus-run-session -- sh -c 'echo | gnome-keyring-daemon --unlock --components=secrets >/dev/null && cargo test --test real_keyring -- --ignored'
+
+  # Windows x86_64 (MSVC): clippy, the whole test suite, a real start of the
+  # app (screenshot), and the release zip installed and removed by install.ps1.
+  windows:
+    runs-on: windows-latest
+    env:
+      # Git's perl (first on PATH) lacks modules OpenSSL's Configure needs.
+      OPENSSL_SRC_PERL: C:\Strawberry\perl\bin\perl.exe
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo clippy -- -D warnings
+        run: cargo clippy --all-targets -- -D warnings
+      - name: cargo test
+        run: cargo test
+      - name: App starts and renders (screenshot)
+        run: |
+          cargo build --bins
+          $p = Start-Process -FilePath target\debug\ferrochat.exe -ArgumentList '--screenshot','chats','win-chats.png' -PassThru -NoNewWindow
+          if (-not $p.WaitForExit(120000)) { $p.Kill(); throw "ferrochat did not finish the screenshot in time" }
+          if ($p.ExitCode -ne 0) { throw "ferrochat exited with $($p.ExitCode)" }
+          if (-not (Test-Path win-chats.png) -or (Get-Item win-chats.png).Length -lt 10000) { throw "no screenshot" }
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: windows-screenshot
+          path: win-chats.png
+          if-no-files-found: ignore
+      - name: Package the zip and install / uninstall it with install.ps1
+        run: |
+          .github/scripts/package-windows.ps1 -Version 0.0.1 -BinDir target/debug -OutDir dist
+          $name = "ferrochat-v0.0.1-windows-x86_64"
+          $dist = (Resolve-Path dist).Path
+          $u = { param($f) ([Uri](Join-Path $dist $f)).AbsoluteUri }
+          @{ tag_name = "v0.0.1"; draft = $false; prerelease = $false; assets = @(
+              @{ name = "$name.zip"; browser_download_url = (& $u "$name.zip") },
+              @{ name = "$name.zip.sha256"; browser_download_url = (& $u "$name.zip.sha256") }) } |
+            ConvertTo-Json -Depth 4 | Set-Content -Encoding utf8 dist/latest.json
+          $env:FERRO_RELEASE_API = & $u "latest.json"
+          ./install.ps1
+          $dir = Join-Path $env:LOCALAPPDATA "Programs\Ferrochat"
+          foreach ($f in "ferrochat.exe", "ferrochat-player.exe", "installed-version", "licenses\OpenSSL-Apache-2.0.txt") {
+            if (-not (Test-Path (Join-Path $dir $f))) { throw "install.ps1 did not install $f" }
+          }
+          if (-not (Test-Path (Join-Path ([Environment]::GetFolderPath("Programs")) "Ferrochat.lnk"))) { throw "no Start Menu shortcut" }
+          & (Join-Path $dir "ferrochat.exe") --help
+          if ($LASTEXITCODE -ne 0) { throw "installed ferrochat.exe --help failed" }
+          ./install.ps1 -Uninstall
+          if (Test-Path $dir) { throw "install.ps1 -Uninstall left $dir" }

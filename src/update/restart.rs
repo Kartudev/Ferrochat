@@ -54,6 +54,12 @@ pub fn run_pending() {
         use std::os::unix::process::CommandExt;
         cmd.process_group(0);
     }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        // DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP: outlives this process.
+        cmd.creation_flags(0x0000_0008 | 0x0000_0200);
+    }
     match cmd.spawn() {
         Ok(_) => tracing::info!("restarted into the updated version"),
         Err(e) => {

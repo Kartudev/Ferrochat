@@ -31,6 +31,16 @@ impl App {
         let api = allowed.then(http::api_endpoint).flatten();
         let path = (!cfg.mock).then(|| cfg.state_dir.join(state::FILE));
         let method = method::detect(&method::probe());
+        if let InstallMethod::Script(layout) = &method
+            && layout.windows
+            && !cfg.mock
+        {
+            // The program a previous update moved aside (it was running then).
+            let dir = layout.bin_dir.clone();
+            let _ = std::thread::Builder::new()
+                .name("updater-cleanup".into())
+                .spawn(move || install::clean_leftovers(&dir));
+        }
         let mut u = Updater::new(method, api, path);
         if matches!(
             cfg.screenshot,
@@ -258,6 +268,7 @@ fn demo(u: &mut Updater) {
     u.method = InstallMethod::Script(ScriptLayout {
         bin_dir: "/nonexistent/bin".into(),
         data_dir: "/nonexistent/share".into(),
+        windows: false,
     });
     u.persisted.release = Some(Release {
         version,

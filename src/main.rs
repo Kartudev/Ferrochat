@@ -1,5 +1,7 @@
 //! Entry point: logging, config, `iced::application(..).run()`.
 #![deny(clippy::unwrap_used, clippy::expect_used)]
+// Windows release builds are GUI programs: no console window behind the app.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 use std::io::Write;
 

@@ -359,6 +359,7 @@ mod tests {
         InstallMethod::Script(ScriptLayout {
             bin_dir: "/b".into(),
             data_dir: "/d".into(),
+            windows: false,
         })
     }
 
