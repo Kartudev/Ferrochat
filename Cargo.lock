@@ -2024,7 +2024,7 @@ dependencies = [
 
 [[package]]
 name = "ferrochat"
-version = "0.15.3"
+version = "0.16.0"
 dependencies = [
  "arboard",
  "async-channel",
