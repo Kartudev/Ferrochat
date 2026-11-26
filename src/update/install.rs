@@ -462,7 +462,8 @@ fn stage_file(from: &Path, to: &Path, mode: u32) -> std::io::Result<()> {
     let _ = fs::remove_file(to);
     fs::copy(from, to)?;
     set_mode(to, mode)?;
-    File::open(to)?.sync_all()
+    // Windows flushes only through a handle with write access.
+    fs::OpenOptions::new().write(true).open(to)?.sync_all()
 }
 
 #[cfg(unix)]
