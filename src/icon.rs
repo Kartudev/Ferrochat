@@ -1,6 +1,7 @@
 //! The app's own icon (`assets/ferrochat*.svg`, original artwork) rendered to
 //! raw pixels for the tray (ARGB32) and the window (RGBA).
 
+use image::ImageEncoder;
 use resvg::tiny_skia::{Pixmap, Transform};
 use resvg::usvg;
 
@@ -48,6 +49,44 @@ pub fn render(svg: &[u8], size: u32) -> Option<Raster> {
         rgba.extend_from_slice(&[c.red(), c.green(), c.blue(), c.alpha()]);
     }
     Some(Raster { size, rgba })
+}
+
+/// `svg` rendered at `size` as a PNG file.
+pub fn png(svg: &[u8], size: u32) -> Option<Vec<u8>> {
+    let r = render(svg, size)?;
+    let mut out = Vec::new();
+    image::codecs::png::PngEncoder::new(&mut out)
+        .write_image(&r.rgba, size, size, image::ExtendedColorType::Rgba8)
+        .ok()?;
+    Some(out)
+}
+
+/// Sizes in the Windows `.ico` (`packaging/ferrochat.ico`, embedded in the exe).
+pub const ICO_SIZES: [u32; 6] = [16, 24, 32, 48, 64, 256];
+
+/// A Windows `.ico` with one PNG image per size (the Vista+ format).
+pub fn ico(svg: &[u8], sizes: &[u32]) -> Option<Vec<u8>> {
+    let images: Vec<Vec<u8>> = sizes.iter().map(|&s| png(svg, s)).collect::<Option<_>>()?;
+    let count = u16::try_from(images.len()).ok()?;
+    let mut out = Vec::new();
+    out.extend_from_slice(&[0, 0, 1, 0]);
+    out.extend_from_slice(&count.to_le_bytes());
+    let mut offset = 6 + 16 * u32::from(count);
+    for (img, &s) in images.iter().zip(sizes) {
+        // 256 is stored as 0.
+        let side = u8::try_from(s).unwrap_or(0);
+        out.extend_from_slice(&[side, side, 0, 0]);
+        out.extend_from_slice(&1u16.to_le_bytes());
+        out.extend_from_slice(&32u16.to_le_bytes());
+        let len = u32::try_from(img.len()).ok()?;
+        out.extend_from_slice(&len.to_le_bytes());
+        out.extend_from_slice(&offset.to_le_bytes());
+        offset += len;
+    }
+    for img in &images {
+        out.extend_from_slice(img);
+    }
+    Some(out)
 }
 
 /// The window icon (64 px), if it renders.
@@ -98,5 +137,21 @@ mod tests {
     #[test]
     fn bad_svg_is_none() {
         assert!(render(b"nope", 22).is_none());
+    }
+
+    /// `packaging/ferrochat.ico` is generated from the SVG: regenerate it
+    /// with `FERRO_WRITE_ICO=1 cargo test --lib icon::` after changing the icon.
+    #[test]
+    fn packaged_ico_matches_the_svg() {
+        let ico = ico(NORMAL_SVG, &ICO_SIZES).expect("ico");
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/packaging/ferrochat.ico");
+        if std::env::var_os("FERRO_WRITE_ICO").is_some() {
+            std::fs::write(path, &ico).unwrap();
+        }
+        assert_eq!(&ico[..6], &[0, 0, 1, 0, 6, 0]);
+        assert!(
+            std::fs::read(path).unwrap() == ico,
+            "packaging/ferrochat.ico is stale"
+        );
     }
 }

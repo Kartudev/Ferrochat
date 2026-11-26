@@ -109,5 +109,10 @@ mod tests {
         let script = include_str!("../../install.sh");
         assert!(script.contains(&format!("REPO=\"{REPO}\"")));
         assert!(script.contains(&format!("raw.githubusercontent.com/{REPO}/main/install.sh")));
+        let ps = include_str!("../../install.ps1");
+        assert!(ps.contains(&format!("$Repo = \"{REPO}\"")));
+        assert!(ps.contains(&format!(
+            "raw.githubusercontent.com/{REPO}/main/install.ps1"
+        )));
     }
 }

@@ -19,6 +19,18 @@ use super::video_proto::{self as proto, Cmd, Msg, PlayState};
 /// Name of the helper executable.
 pub const HELPER_NAME: &str = "ferrochat-player";
 
+/// The helper's file name on disk (`ferrochat-player.exe` on Windows).
+#[cfg(windows)]
+pub const HELPER_FILE: &str = "ferrochat-player.exe";
+/// The helper's file name on disk (`ferrochat-player.exe` on Windows).
+#[cfg(not(windows))]
+pub const HELPER_FILE: &str = HELPER_NAME;
+
+/// Windows `CREATE_NO_WINDOW`: the helper is a console program, and without
+/// this flag every video would flash a console window over the app.
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
 /// What went wrong, in terms the user can act on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Failure {
@@ -110,7 +122,7 @@ pub enum Event {
 
 /// The helper inside `dir`, if it is there.
 pub fn helper_in(dir: &Path) -> Option<PathBuf> {
-    let p = dir.join(HELPER_NAME);
+    let p = dir.join(HELPER_FILE);
     p.is_file().then_some(p)
 }
 
@@ -126,10 +138,16 @@ pub fn helper_path() -> Option<PathBuf> {
         if let Some(p) = dir.parent().and_then(helper_in) {
             return Some(p);
         }
+        // Newer Cargo (build-dir layout, Rust 1.100+) runs unit tests from
+        // target/debug/build/<pkg>/<hash>/out: the helper is a few levels up.
+        #[cfg(test)]
+        if let Some(p) = dir.ancestors().skip(2).take(4).find_map(helper_in) {
+            return Some(p);
+        }
     }
     let path = std::env::var_os("PATH")?;
     std::env::split_paths(&path)
-        .map(|d| d.join(HELPER_NAME))
+        .map(|d| d.join(HELPER_FILE))
         .find(|p| p.is_file())
 }
 
@@ -151,11 +169,17 @@ pub fn spawn_with(
     helper: &Path,
     file: &Path,
 ) -> Result<(Player, mpsc::UnboundedReceiver<Event>), Failure> {
-    let mut child = Command::new(helper)
-        .arg(file)
+    let mut cmd = Command::new(helper);
+    cmd.arg(file)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    let mut child = cmd
         .spawn()
         .map_err(|e| Failure::Unavailable(format!("cannot start the video helper: {e}")))?;
     let (Some(stdout), Some(stderr), stdin) =
@@ -362,14 +386,17 @@ pub async fn gif_to_mp4_with(
     mp4: &Path,
     wait: std::time::Duration,
 ) -> Result<(), Failure> {
-    let child = tokio::process::Command::new(helper)
-        .arg(GIF_TO_MP4_FLAG)
+    let mut cmd = tokio::process::Command::new(helper);
+    cmd.arg(GIF_TO_MP4_FLAG)
         .arg(gif)
         .arg(mp4)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
-        .kill_on_drop(true)
+        .kill_on_drop(true);
+    #[cfg(windows)]
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    let child = cmd
         .spawn()
         .map_err(|e| Failure::Unavailable(format!("cannot start the video helper: {e}")))?;
     let out = tokio::time::timeout(wait, child.wait_with_output())

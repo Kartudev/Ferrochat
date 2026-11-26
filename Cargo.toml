@@ -1,6 +1,6 @@
 [package]
 name = "ferrochat"
-version = "0.15.0"
+version = "0.15.3"
 edition = "2024"
 rust-version = "1.94"
 description = "Unofficial lightweight native WhatsApp desktop client written in Rust"
@@ -94,12 +94,25 @@ sha2 = "0.11"
 flate2 = "1"
 # Updater: reads the release tarball (new; pure Rust, xattr feature off).
 tar = { version = "0.4", default-features = false }
+# Updater: reads the Windows release .zip (new; only deflate through the flate2 already here).
+zip = { version = "9", default-features = false, features = ["deflate-flate2"] }
 # Renders the app's SVG icon to ARGB32 tray pixmaps / the window icon (already in the tree via iced's svg).
 resvg = { version = "0.45", default-features = false }
+
+[target.'cfg(windows)'.dependencies]
+# Windows has no system OpenSSL for SQLCipher: build it from source (same libsqlite3-sys, one more feature).
+libsqlite3-sys = { version = "0.37", features = ["bundled-sqlcipher-vendored-openssl"] }
+# "Start at login" (HKCU Run key); already in the tree via tokio/winit, only the registry API is added.
+# Same crate, also the notification-area tray icon (Shell_NotifyIconW, menus, icons).
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Registry", "Win32_System_LibraryLoader", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging", "Win32_Graphics_Gdi"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # StatusNotifierItem tray icon, pure Rust over zbus 5 (the zbus already in the tree).
 ksni = { version = "0.3", default-features = false, features = ["async-io"] }
+
+[build-dependencies]
+# Embeds the .ico into ferrochat.exe on Windows (rc.exe / windres); does nothing on other targets.
+embed-resource = "3"
 
 [dev-dependencies]
 # Reads the bundled Twemoji's tables in tests (already in the tree via fontdb).

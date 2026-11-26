@@ -4,6 +4,12 @@
 //! `.<name>.new.<pid>` + rename), with a rollback if a rename fails halfway.
 //! Everything is written next to the targets first (same filesystem, so the
 //! renames are atomic); any failure leaves the current install untouched.
+//!
+//! Windows (a folder install from the release `.zip`): a running `.exe`
+//! cannot be overwritten or deleted, but it can be renamed. Each program is
+//! moved aside to `.<name>.exe.old.<pid>` and the new one renamed into its
+//! place ([`replace_moving`]); the old copies are deleted on the next start
+//! ([`clean_leftovers`]), once nothing runs them.
 
 use std::fs::{self, File};
 use std::io::{BufWriter, Read, Write};
@@ -87,7 +93,11 @@ pub fn install(
     )?;
     let expected = parse_checksum(&String::from_utf8_lossy(&sum), &package.archive.name)?;
 
-    let archive = work.path.join("release.tar.gz");
+    let archive = work.path.join(if layout.windows {
+        "release.zip"
+    } else {
+        "release.tar.gz"
+    });
     let file = File::create(&archive).map_err(|e| io_msg("create the download", &e))?;
     let mut out = HashingWriter {
         inner: BufWriter::new(file),
@@ -214,6 +224,13 @@ impl Drop for WorkDir {
     }
 }
 
+/// Removes what earlier updates left in `bin_dir`: temp files of updates
+/// whose process is gone and, on Windows, the moved-aside old programs
+/// (deleting one that still runs fails and is retried next time).
+pub fn clean_leftovers(bin_dir: &Path) {
+    clean_stale(bin_dir);
+}
+
 /// Removes temp files of updates whose process is gone.
 fn clean_stale(bin_dir: &Path) {
     let Ok(dir) = fs::read_dir(bin_dir) else {
@@ -222,6 +239,7 @@ fn clean_stale(bin_dir: &Path) {
     let ours = std::process::id().to_string();
     let names: Vec<String> = std::iter::once(CRATE)
         .chain(HELPERS.iter().copied())
+        .flat_map(|n| [n.to_string(), format!("{n}.exe")])
         .flat_map(|n| [format!(".{n}.new."), format!(".{n}.old.")])
         .chain([WORK_PREFIX.to_string()])
         .collect();
@@ -230,10 +248,15 @@ fn clean_stale(bin_dir: &Path) {
         let Some(pid) = names.iter().find_map(|p| name.strip_prefix(p.as_str())) else {
             continue;
         };
-        if pid == ours || !pid.bytes().all(|b| b.is_ascii_digit()) {
+        if !pid.bytes().all(|b| b.is_ascii_digit()) {
             continue;
         }
-        if Path::new("/proc").join(pid).exists() {
+        // Our own temp files are in use; our own moved-aside old program is
+        // only kept while it runs (deleting it then fails).
+        if pid == ours && (!name.contains(".old.") || cfg!(target_os = "linux")) {
+            continue;
+        }
+        if leftover_in_use(&name, pid, &entry) {
             continue;
         }
         let p = entry.path();
@@ -245,13 +268,35 @@ fn clean_stale(bin_dir: &Path) {
     }
 }
 
-/// Unpacks a `.tar.gz` and installs it like install.sh.
+/// Whether a leftover of update process `pid` may still be in use. Linux
+/// asks `/proc`. Elsewhere an old program is always tried (deleting a
+/// running `.exe` just fails) and temp files count as in use for an hour.
+fn leftover_in_use(name: &str, pid: &str, entry: &fs::DirEntry) -> bool {
+    if cfg!(target_os = "linux") {
+        return Path::new("/proc").join(pid).exists();
+    }
+    if name.contains(".old.") {
+        return false;
+    }
+    entry
+        .metadata()
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.elapsed().ok())
+        .is_none_or(|age| age < std::time::Duration::from_secs(3600))
+}
+
+/// Unpacks the release archive and installs it: a `.tar.gz` like install.sh,
+/// or the Windows `.zip` into its folder.
 pub fn install_archive(
     layout: &ScriptLayout,
     archive: &Path,
     work: &Path,
     version: &str,
 ) -> Result<(), String> {
+    if layout.windows {
+        return install_zip(layout, archive, work, version);
+    }
     let x = work.join("x");
     fs::create_dir(&x).map_err(|e| io_msg("unpack the update", &e))?;
     let f = File::open(archive).map_err(|e| io_msg("open the download", &e))?;
@@ -317,11 +362,108 @@ pub fn install_archive(
     Ok(())
 }
 
+/// Unpacks the Windows `.zip` and installs its programs into the folder.
+fn install_zip(
+    layout: &ScriptLayout,
+    archive: &Path,
+    work: &Path,
+    version: &str,
+) -> Result<(), String> {
+    let x = work.join("x");
+    fs::create_dir(&x).map_err(|e| io_msg("unpack the update", &e))?;
+    let f = File::open(archive).map_err(|e| io_msg("open the download", &e))?;
+    safe_extract_zip(std::io::BufReader::new(f), &x, MAX_EXTRACT)?;
+    let src = single_top_dir(&x)?;
+    let exe = |name: &str| format!("{name}.exe");
+    if !src.join(exe(CRATE)).is_file() {
+        return Err(format!("The update has no {CRATE}.exe program."));
+    }
+    let pid = std::process::id();
+    let mut staged = Vec::new();
+    for name in std::iter::once(CRATE).chain(HELPERS.iter().copied()) {
+        let from = src.join(exe(name));
+        if !from.is_file() {
+            continue;
+        }
+        let tmp = layout.bin_dir.join(format!(".{}.new.{pid}", exe(name)));
+        if let Err(e) = stage_file(&from, &tmp, 0o755) {
+            for (t, _) in &staged {
+                let _ = fs::remove_file(t);
+            }
+            let _ = fs::remove_file(&tmp);
+            return Err(io_msg("write the new program", &e));
+        }
+        staged.push((tmp, layout.bin(name)));
+    }
+    replace_moving(&staged)?;
+    if let Err(e) = write_if_changed(&layout.version_file(), format!("{version}\n").as_bytes()) {
+        tracing::warn!(error = %e, "could not record the installed version");
+    }
+    Ok(())
+}
+
+/// Replaces each target by moving it aside (`.<name>.old.<pid>`) and then
+/// renaming the staged file into its place: the only way to replace a
+/// program that is running on Windows. If a step fails, everything already
+/// moved is put back. The moved-aside files are deleted when possible; the
+/// running program's copy stays until [`clean_leftovers`] on a later start.
+pub fn replace_moving(staged: &[(PathBuf, PathBuf)]) -> Result<(), String> {
+    let pid = std::process::id();
+    // (target, its moved-aside copy) for every target already replaced.
+    let mut done: Vec<(&Path, Option<PathBuf>)> = Vec::new();
+    let undo = |done: &[(&Path, Option<PathBuf>)]| {
+        for (target, bak) in done.iter().rev() {
+            let _ = fs::remove_file(target);
+            if let Some(b) = bak {
+                let _ = fs::rename(b, target);
+            }
+        }
+        for (s, _) in staged {
+            let _ = fs::remove_file(s);
+        }
+    };
+    for (s, target) in staged {
+        let bak = if fs::symlink_metadata(target).is_ok() {
+            let name = target
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let bak = target.with_file_name(format!(".{name}.old.{pid}"));
+            let _ = fs::remove_file(&bak);
+            if let Err(e) = fs::rename(target, &bak) {
+                tracing::warn!(error = %e, "update move-aside failed; rolling back");
+                undo(&done);
+                return Err(io_msg("replace the program (nothing was changed)", &e));
+            }
+            Some(bak)
+        } else {
+            None
+        };
+        if let Err(e) = fs::rename(s, target) {
+            tracing::warn!(error = %e, "update rename failed; rolling back");
+            if let Some(b) = &bak {
+                let _ = fs::rename(b, target);
+            }
+            undo(&done);
+            return Err(io_msg("replace the program (nothing was changed)", &e));
+        }
+        done.push((target, bak));
+    }
+    for (_, bak) in &done {
+        if let Some(b) = bak {
+            // Fails for the program that is running (Windows): left for later.
+            let _ = fs::remove_file(b);
+        }
+    }
+    Ok(())
+}
+
 fn stage_file(from: &Path, to: &Path, mode: u32) -> std::io::Result<()> {
     let _ = fs::remove_file(to);
     fs::copy(from, to)?;
     set_mode(to, mode)?;
-    File::open(to)?.sync_all()
+    // Windows flushes only through a handle with write access.
+    fs::OpenOptions::new().write(true).open(to)?.sync_all()
 }
 
 #[cfg(unix)]
@@ -535,6 +677,63 @@ pub fn safe_extract(reader: impl Read, dest: &Path, cap: u64) -> Result<(), Stri
     Ok(())
 }
 
+/// Unpacks a zip into `dest` with the same rules as [`safe_extract`]:
+/// plain relative names only (backslashes count as separators), no links,
+/// capped total size and entry count. The zip reader checks each file's CRC.
+pub fn safe_extract_zip(
+    reader: impl Read + std::io::Seek,
+    dest: &Path,
+    cap: u64,
+) -> Result<(), String> {
+    let bad = |what: &str| format!("The update archive is not valid ({what}).");
+    let mut archive = zip::ZipArchive::new(reader).map_err(|_| bad("unreadable"))?;
+    if archive.len() > MAX_ENTRIES {
+        return Err(bad("too many files"));
+    }
+    let mut total = 0u64;
+    for i in 0..archive.len() {
+        let mut entry = archive.by_index(i).map_err(|_| bad("unreadable"))?;
+        let name = String::from_utf8_lossy(entry.name_raw()).replace('\\', "/");
+        if name.contains(':') {
+            return Err(bad("unsafe path"));
+        }
+        let rel = safe_relative(Path::new(&name)).ok_or_else(|| bad("unsafe path"))?;
+        if rel.as_os_str().is_empty() {
+            continue;
+        }
+        if entry.is_symlink() {
+            return Err(bad("contains a link"));
+        }
+        let out = dest.join(&rel);
+        if entry.is_dir() {
+            fs::create_dir_all(&out).map_err(|e| io_msg("unpack the update", &e))?;
+            continue;
+        }
+        if !entry.is_file() {
+            return Err(bad("contains a special file"));
+        }
+        let size = entry.size();
+        total = total.saturating_add(size);
+        if total > cap {
+            return Err(bad("too large"));
+        }
+        if let Some(parent) = out.parent() {
+            fs::create_dir_all(parent).map_err(|e| io_msg("unpack the update", &e))?;
+        }
+        let mut f = File::create(&out).map_err(|e| io_msg("unpack the update", &e))?;
+        let copied = std::io::copy(&mut (&mut entry).take(size.saturating_add(1)), &mut f)
+            .map_err(|_| bad("damaged"))?;
+        if copied != size {
+            return Err(bad("truncated"));
+        }
+        drop(f);
+        let exec = name.ends_with(".exe") || entry.unix_mode().is_some_and(|m| m & 0o111 != 0);
+        set_mode(&out, if exec { 0o755 } else { 0o644 })
+            .map_err(|e| io_msg("unpack the update", &e))?;
+    }
+    Ok(())
+}
+
 /// `path` as plain relative components, or `None` if it is absolute or
 /// climbs out with `..`.
 fn safe_relative(path: &Path) -> Option<PathBuf> {
@@ -720,6 +919,23 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(target_os = "linux"))]
+    fn old_programs_are_removed_and_fresh_temp_files_kept_off_linux() {
+        let d = temp("stale-win");
+        fs::write(d.join(".ferrochat.exe.old.99999999"), b"x").unwrap();
+        fs::write(d.join(".ferrochat-player.exe.old.1234"), b"x").unwrap();
+        fs::write(d.join(".ferrochat.exe.new.99999999"), b"x").unwrap();
+        fs::write(d.join("ferrochat.exe"), b"keep").unwrap();
+        clean_leftovers(&d);
+        assert!(!d.join(".ferrochat.exe.old.99999999").exists());
+        assert!(!d.join(".ferrochat-player.exe.old.1234").exists());
+        assert!(d.join(".ferrochat.exe.new.99999999").exists());
+        assert!(d.join("ferrochat.exe").exists());
+        let _ = fs::remove_dir_all(d);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
     fn stale_temp_files_of_dead_processes_are_cleaned() {
         let d = temp("stale");
         // PIDs above the kernel maximum never exist.
@@ -737,6 +953,90 @@ mod tests {
             !d.join(format!("{WORK_PREFIX}{}", std::process::id()))
                 .exists()
         );
+        let _ = fs::remove_dir_all(d);
+    }
+
+    fn zip_of(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut z = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        for (name, data) in entries {
+            if name.ends_with('/') {
+                z.add_directory(*name, zip::write::SimpleFileOptions::default())
+                    .unwrap();
+            } else {
+                z.start_file(*name, zip::write::SimpleFileOptions::default())
+                    .unwrap();
+                z.write_all(data).unwrap();
+            }
+        }
+        z.finish().unwrap().into_inner()
+    }
+
+    #[test]
+    fn zip_extracts_plain_files_and_backslash_names() {
+        let d = temp("zip-ok");
+        let z = zip_of(&[
+            ("top/", b""),
+            ("top/ferrochat.exe", b"app"),
+            ("top\\licenses\\a.txt", b"lic"),
+        ]);
+        safe_extract_zip(std::io::Cursor::new(z), &d, 1024).unwrap();
+        assert_eq!(fs::read(d.join("top/ferrochat.exe")).unwrap(), b"app");
+        assert_eq!(fs::read(d.join("top/licenses/a.txt")).unwrap(), b"lic");
+        let _ = fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn zip_rejects_traversal_drive_paths_and_oversize() {
+        let d = temp("zip-bad");
+        for name in [
+            "../evil",
+            "top/../../evil",
+            "/abs",
+            "C:/evil",
+            "top\\..\\..\\evil",
+        ] {
+            let z = zip_of(&[(name, b"x")]);
+            let e = safe_extract_zip(std::io::Cursor::new(z), &d, 1024).unwrap_err();
+            assert!(e.contains("unsafe path"), "{name}: {e}");
+        }
+        let z = zip_of(&[("top/big", &[0u8; 64])]);
+        let e = safe_extract_zip(std::io::Cursor::new(z), &d, 10).unwrap_err();
+        assert!(e.contains("too large"), "{e}");
+        assert!(safe_extract_zip(std::io::Cursor::new(b"not a zip".to_vec()), &d, 10).is_err());
+        let _ = fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn replace_moving_swaps_and_rolls_back() {
+        let d = temp("moving");
+        fs::write(d.join("a.exe"), b"old-a").unwrap();
+        fs::write(d.join(".a.new"), b"new-a").unwrap();
+        fs::write(d.join(".b.new"), b"new-b").unwrap();
+        // b's staged file is missing: its rename fails and a is put back.
+        let staged = vec![
+            (d.join(".a.new"), d.join("a.exe")),
+            (d.join(".missing"), d.join("b.exe")),
+        ];
+        assert!(replace_moving(&staged).is_err());
+        assert_eq!(fs::read(d.join("a.exe")).unwrap(), b"old-a");
+        assert!(!d.join("b.exe").exists());
+        assert!(!d.join(".a.new").exists());
+
+        fs::write(d.join(".a.new"), b"new-a").unwrap();
+        let staged = vec![
+            (d.join(".a.new"), d.join("a.exe")),
+            (d.join(".b.new"), d.join("b.exe")),
+        ];
+        replace_moving(&staged).unwrap();
+        assert_eq!(fs::read(d.join("a.exe")).unwrap(), b"new-a");
+        assert_eq!(fs::read(d.join("b.exe")).unwrap(), b"new-b");
+        let left: Vec<_> = fs::read_dir(&d)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with('.'))
+            .collect();
+        assert!(left.is_empty(), "{left:?}");
         let _ = fs::remove_dir_all(d);
     }
 }

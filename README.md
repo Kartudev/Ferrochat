@@ -43,8 +43,29 @@ tar xzf ferrochat-*-linux-x86_64.tar.gz
 The tarball also has `packaging/dev.ferro.ferrochat.desktop` and `.svg` if you want
 a menu entry. Releases are built on Ubuntu 22.04 (glibc 2.35).
 
+### Windows
+
+Windows 10/11 x86_64, no admin rights needed. In PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/Kartudev/Ferrochat-kartu/main/install.ps1 | iex
+```
+
+It installs into `%LOCALAPPDATA%\Programs\Ferrochat` with a Start Menu shortcut.
+Uninstall (program folder, shortcut and "start at login" only):
+
+```powershell
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/Kartudev/Ferrochat-kartu/main/install.ps1))) -Uninstall
+```
+
+Or download `ferrochat-vX.Y.Z-windows-x86_64.zip`, check it against its
+`.sha256` (`Get-FileHash`), unpack it anywhere you can write to and run
+`ferrochat.exe`. That folder updates itself too. Closing the window keeps
+Ferrochat in the notification area (tray icon), like on Linux.
+
 Ferrochat checks for a new release when it starts and every few hours, and
-shows a slim banner when one is out. Installs made with `install.sh` update
+shows a slim banner when one is out. Installs made with `install.sh` (or the
+Windows zip / `install.ps1`) update
 in place from the banner or Settings → Updates (download, SHA-256 check,
 atomic replace, then "Restart now"). A `cargo install` copy shows the cargo
 command instead, and other installs link to the release page. Turn the
@@ -129,7 +150,9 @@ statically) and AAC (symphonia, pure Rust); it also reads videos before
 they are sent and turns GIFs into MP4 (OpenH264's encoder). Videos in other formats (H.265)
 show which codec is missing and an "Open externally" button. Build with
 `--no-default-features` to leave the helper out. Linux (KDE Plasma / Wayland) is the primary
-target; Windows and macOS should build but are not tested.
+target. Windows x86_64 (MSVC) is built and tested in CI; it needs Strawberry
+Perl for the vendored OpenSSL (`OPENSSL_SRC_PERL`). macOS should build but is
+not tested.
 
 ## Run
 

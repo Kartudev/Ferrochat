@@ -1,7 +1,7 @@
 name: Release
 
-# Publishes a GitHub Release (Linux x86_64 tarball + .sha256) after every
-# successful "Version bump" run on main. The bump commit that workflow pushes
+# Publishes a GitHub Release (Linux x86_64 tarball + Windows x86_64 zip, each
+# with a .sha256) after every successful "Version bump" run on main. The bump commit that workflow pushes
 # uses GITHUB_TOKEN, which never triggers `push` workflows, so this chains off
 # `workflow_run` instead. Re-run manually from Actions -> Release -> Run
 # workflow; it skips when release v<Cargo.toml version> already exists.
@@ -23,10 +23,13 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  release:
+  prepare:
     if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
-    # Oldest supported runner image: the binary links an older glibc and so runs on more distros.
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+      sha: ${{ steps.ver.outputs.sha }}
+      skip: ${{ steps.ver.outputs.skip }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -47,6 +50,46 @@ jobs:
           else
             echo "skip=false" >> "$GITHUB_OUTPUT"
           fi
+
+  windows:
+    needs: prepare
+    if: needs.prepare.outputs.skip != 'true'
+    runs-on: windows-latest
+    env:
+      OPENSSL_SRC_PERL: C:\Strawberry\perl\bin\perl.exe
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build release binaries
+        run: cargo build --release --locked
+      - name: Package
+        run: .github/scripts/package-windows.ps1 -Version "${{ needs.prepare.outputs.version }}" -BinDir target/release -OutDir dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-release
+          path: |
+            dist/*.zip
+            dist/*.zip.sha256
+          if-no-files-found: error
+
+  release:
+    needs: [prepare, windows]
+    if: needs.prepare.outputs.skip != 'true'
+    # Oldest supported runner image: the binary links an older glibc and so runs on more distros.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+      - name: Version
+        id: ver
+        run: |
+          echo "version=${{ needs.prepare.outputs.version }}" >> "$GITHUB_OUTPUT"
+          echo "sha=${{ needs.prepare.outputs.sha }}" >> "$GITHUB_OUTPUT"
+          echo "skip=false" >> "$GITHUB_OUTPUT"
       - name: Install system libraries
         if: steps.ver.outputs.skip != 'true'
         run: |
@@ -90,6 +133,16 @@ jobs:
           tar -C dist -czf "dist/$name.tar.gz" "$name"
           (cd dist && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256")
           ls -l dist
+      - uses: actions/download-artifact@v4
+        if: steps.ver.outputs.skip != 'true'
+        with:
+          name: windows-release
+          path: dist
+      - name: Check the Windows zip checksum
+        if: steps.ver.outputs.skip != 'true'
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: (cd dist && sha256sum -c "ferrochat-v${VERSION}-windows-x86_64.zip.sha256")
       - name: Create GitHub Release
         if: steps.ver.outputs.skip != 'true'
         env:
@@ -99,6 +152,8 @@ jobs:
         run: |
           set -euo pipefail
           name="ferrochat-v${VERSION}-linux-x86_64"
+          win="ferrochat-v${VERSION}-windows-x86_64"
           gh release create "v${VERSION}" --target "$SHA" \
             --title "Ferrochat v${VERSION}" --generate-notes \
-            "dist/$name.tar.gz" "dist/$name.tar.gz.sha256"
+            "dist/$name.tar.gz" "dist/$name.tar.gz.sha256" \
+            "dist/$win.zip" "dist/$win.zip.sha256"

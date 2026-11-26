@@ -13,30 +13,33 @@
 //! Failures name the step that failed (open, container, codec, decode) so
 //! the viewer can say what happened.
 
-#[cfg(unix)]
 mod audio;
-#[cfg(unix)]
 mod demux;
-#[cfg(unix)]
 mod gif;
-#[cfg(unix)]
 mod yuv;
 
-#[cfg(unix)]
 fn main() {
     player::run();
 }
 
-#[cfg(not(unix))]
-fn main() {
-    eprintln!("ferrochat-player: only supported on Unix");
-    std::process::exit(2);
+/// A second handle to stdout as a plain file: no line buffering (Unix) and
+/// no console text handling (Windows) for binary frames.
+#[cfg(unix)]
+fn raw_stdout() -> std::io::Result<std::fs::File> {
+    use std::os::fd::AsFd;
+    Ok(std::io::stdout().as_fd().try_clone_to_owned()?.into())
 }
 
-#[cfg(unix)]
+/// A second handle to stdout as a plain file: no line buffering (Unix) and
+/// no console text handling (Windows) for binary frames.
+#[cfg(windows)]
+fn raw_stdout() -> std::io::Result<std::fs::File> {
+    use std::os::windows::io::AsHandle;
+    Ok(std::io::stdout().as_handle().try_clone_to_owned()?.into())
+}
+
 mod player {
     use std::io::{self, BufRead, BufWriter, Write};
-    use std::os::fd::AsFd;
     use std::path::Path;
     use std::sync::mpsc::{self, RecvTimeoutError};
     use std::time::{Duration, Instant};
@@ -77,11 +80,7 @@ mod player {
             std::process::exit(2);
         };
         // stdout as a plain file: no line buffering for binary frames.
-        let out_file = match io::stdout()
-            .as_fd()
-            .try_clone_to_owned()
-            .map(std::fs::File::from)
-        {
+        let out_file = match super::raw_stdout() {
             Ok(f) => f,
             Err(_) => std::process::exit(2),
         };

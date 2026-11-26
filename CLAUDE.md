@@ -47,6 +47,22 @@ ubuntu-22.04, and creates GitHub Release `v<Cargo version>` with `ferrochat-v<ve
 `install.sh` (`curl ... | sh`; `-s -- --uninstall`); test it with `FERRO_RELEASE_API=file://...`.
 Wayland `app_id` / desktop entry id: `dev.ferro.ferrochat` (`packaging/`).
 
+## Windows
+- CI job `windows` (windows-latest, MSVC): clippy, full tests, `--screenshot`, and the zip
+  (`.github/scripts/package-windows.ps1`) installed/removed by `install.ps1`. Needs
+  `OPENSSL_SRC_PERL=C:\Strawberry\perl\bin\perl.exe` (SQLCipher's OpenSSL is vendored on `cfg(windows)`).
+- Release asset `ferrochat-v<ver>-windows-x86_64.zip` (+ `.sha256`), vcruntime140.dll bundled app-local.
+  A folder with `installed-version` next to `ferrochat.exe` self-updates (`ScriptLayout::windows`):
+  running `.exe`s are renamed to `.<name>.exe.old.<pid>` (`install::replace_moving`), never overwritten;
+  `clean_leftovers` deletes them on the next start. Sync staged files through a WRITE handle.
+- Release builds use `windows_subsystem = "windows"`; children (helper) get `CREATE_NO_WINDOW`.
+- Autostart = HKCU Run value `Ferrochat` (`autostart::windows`); single instance = loopback TCP port in
+  `<data_dir>/ferrochat.port`.
+- Tray (`tray/windows.rs`): raw `Shell_NotifyIconW` on its own thread with a hidden window + message
+  loop; model updates are posted (`WM_REFRESH`), re-added on `TaskbarCreated`, removed by
+  `tray::shutdown()` at quit. Exe icon: `packaging/ferrochat.ico` (generated, `icon::tests`) embedded
+  by `build.rs` (embed-resource) only for Windows targets.
+
 ## Gotchas
 - Only ONE `libsqlite3-sys` may link: it is pinned to 0.37 with `bundled-sqlcipher`;
   `rusqlite` must stay on 0.39 and `whatsapp-rust` default features stay OFF.
