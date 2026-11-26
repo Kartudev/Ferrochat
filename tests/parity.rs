@@ -133,6 +133,7 @@ impl Driver {
                 ids,
                 status,
                 participant: Some(p),
+                ..
             } => {
                 let changed = self
                     .store
@@ -200,6 +201,7 @@ fn live_msg(id: &str, chat: &str, sender: &str, text: &str, ts: i64) -> Message 
         expires_at: None,
         reply: None,
         edited: false,
+        forwarded: None,
         mentions: Vec::new(),
         reactions: Vec::new(),
     }

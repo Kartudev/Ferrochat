@@ -155,10 +155,10 @@ mod tests {
     fn body(tag: &str, draft: bool, pre: bool) -> String {
         format!(
             r#"{{"tag_name":"{tag}","draft":{draft},"prerelease":{pre},
-            "html_url":"https://github.com/FerroApps/Ferrochat/releases/tag/{tag}",
+            "html_url":"https://github.com/Kartudev/Ferrochat-kartu/releases/tag/{tag}",
             "body":"notes","assets":[
-              {{"name":"ferrochat-v9.1.0-linux-x86_64.tar.gz","browser_download_url":"https://github.com/FerroApps/Ferrochat/releases/download/v9.1.0/ferrochat-v9.1.0-linux-x86_64.tar.gz","size":123}},
-              {{"name":"ferrochat-v9.1.0-linux-x86_64.tar.gz.sha256","browser_download_url":"https://github.com/FerroApps/Ferrochat/releases/download/v9.1.0/ferrochat-v9.1.0-linux-x86_64.tar.gz.sha256","size":99}},
+              {{"name":"ferrochat-v9.1.0-linux-x86_64.tar.gz","browser_download_url":"https://github.com/Kartudev/Ferrochat-kartu/releases/download/v9.1.0/ferrochat-v9.1.0-linux-x86_64.tar.gz","size":123}},
+              {{"name":"ferrochat-v9.1.0-linux-x86_64.tar.gz.sha256","browser_download_url":"https://github.com/Kartudev/Ferrochat-kartu/releases/download/v9.1.0/ferrochat-v9.1.0-linux-x86_64.tar.gz.sha256","size":99}},
               {{"name":"ferrochat-v9.1.0-linux-x86_64.tar.gz.sig","browser_download_url":"https://example.com/x","size":1}}
             ]}}"#
         )
@@ -172,7 +172,7 @@ mod tests {
         assert_eq!(r.version, Version::new(9, 1, 0));
         assert_eq!(
             r.html_url,
-            "https://github.com/FerroApps/Ferrochat/releases/tag/v9.1.0"
+            "https://github.com/Kartudev/Ferrochat-kartu/releases/tag/v9.1.0"
         );
         assert_eq!(r.assets.len(), 3);
         assert_eq!(r.assets[0].size, 123);

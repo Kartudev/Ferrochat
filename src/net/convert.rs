@@ -8,9 +8,9 @@ use whatsapp_rust::waproto::whatsapp as wa;
 
 use super::Event;
 use super::types::{
-    ChatFlag, ChatMeta, Content, LinkPreview, ListDef, ListKind, MediaKind, MediaRef, Message,
-    MsgKey, NameSource, OutgoingKind, OutgoingMedia, QUOTE_PREVIEW_MAX, Quote, Reaction,
-    ReceiptStatus,
+    ChatFlag, ChatMeta, Content, LinkPreview, ListDef, ListKind, MUTE_FOREVER, MUTE_OFF, MediaKind,
+    MediaRef, Message, MsgKey, NameSource, OutgoingKind, OutgoingMedia, QUOTE_PREVIEW_MAX, Quote,
+    Reaction, ReceiptStatus, mute_active,
 };
 
 /// Unwraps ephemeral / view-once / edited / caption wrappers (up to a few
@@ -230,6 +230,7 @@ fn video_content(v: &wa::message::VideoMessage) -> Content {
             v.file_length,
             v.mimetype.as_ref(),
         ),
+        gif: v.gif_playback.unwrap_or_default(),
     }
 }
 
@@ -330,11 +331,214 @@ pub fn pin_flag(a: &wa::sync_action_value::PinAction) -> ChatFlag {
     ChatFlag::Pinned(a.pinned.unwrap_or(false))
 }
 
-/// See [`archive_flag`]. A mute whose end time has passed counts as unmuted.
-pub fn mute_flag(a: &wa::sync_action_value::MuteAction, now_secs: i64) -> ChatFlag {
-    let end = a.mute_end_timestamp.unwrap_or(0);
-    // WhatsApp uses -1 for "forever"; the timestamp is in seconds.
-    ChatFlag::Muted(a.muted.unwrap_or(false) && (end <= 0 || end > now_secs))
+/// See [`archive_flag`]. The end time is kept as sent (an expired one
+/// simply no longer counts, see [`ChatMeta::is_muted`]).
+pub fn mute_flag(a: &wa::sync_action_value::MuteAction) -> ChatFlag {
+    if !a.muted.unwrap_or(false) {
+        return ChatFlag::Muted(MUTE_OFF);
+    }
+    ChatFlag::Muted(mute_end_secs(a.mute_end_timestamp.unwrap_or(MUTE_FOREVER)))
+}
+
+/// A protocol mute end (milliseconds in sync actions, seconds in older
+/// history blobs; `-1` or `0` = forever) as [`ChatMeta::mute_end`].
+pub fn mute_end_secs(raw: i64) -> i64 {
+    match raw {
+        r if r <= 0 => MUTE_FOREVER,
+        // Later than year 5000 in seconds: it is milliseconds.
+        r if r > 100_000_000_000 => r / 1000,
+        r => r,
+    }
+}
+
+/// `Some(forwardingScore)` when the message carries the forwarded mark.
+pub fn forward_from_wa(msg: &wa::Message) -> Option<u32> {
+    let ctx = context_info(msg)?;
+    let score = ctx.forwarding_score.unwrap_or(0);
+    (ctx.is_forwarded == Some(true) || score > 0).then_some(score)
+}
+
+/// CDN host media URLs are built on when only the direct path is known
+/// (forwards of cached media; recipients download through the path).
+const MEDIA_HOST: &str = "https://mmg.whatsapp.net";
+
+/// The body to send when forwarding `content` (see
+/// `MessageExt::prepare_for_forward`): rebuilt from the cached content, the
+/// media relayed from the same CDN blob, `source_forward` being the source's
+/// own forwarded mark. `None` for what cannot be forwarded.
+pub fn build_forward(content: &Content, source_forward: Option<u32>) -> Option<wa::Message> {
+    use whatsapp_rust::wacore::proto_helpers::MessageExt;
+    let ctx = || {
+        buffa_some(wa::ContextInfo {
+            is_forwarded: source_forward.map(|_| true),
+            forwarding_score: source_forward.filter(|s| *s > 0),
+            ..Default::default()
+        })
+    };
+    let usable = |m: &Option<MediaRef>| m.clone().filter(|m| !m.media_key.is_empty());
+    let url = |m: &MediaRef| Some(format!("{MEDIA_HOST}{}", m.direct_path));
+    let msg = match content {
+        Content::Text(text) => wa::Message {
+            extended_text_message: buffa_some(wa::message::ExtendedTextMessage {
+                text: Some(text.clone()),
+                context_info: ctx(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        Content::Link { text, preview } => wa::Message {
+            extended_text_message: buffa_some(wa::message::ExtendedTextMessage {
+                text: Some(text.clone()),
+                matched_text: Some(preview.url.clone()),
+                title: Some(preview.title.clone()),
+                description: Some(preview.description.clone()),
+                jpeg_thumbnail: preview.thumbnail.clone(),
+                context_info: ctx(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        Content::Image {
+            caption,
+            width,
+            height,
+            thumbnail,
+            media,
+        } => {
+            let m = usable(media)?;
+            wa::Message {
+                image_message: buffa_some(wa::message::ImageMessage {
+                    url: url(&m),
+                    mimetype: Some(m.mimetype.clone()),
+                    caption: caption.clone(),
+                    file_sha256: Some(m.file_sha256.clone()),
+                    file_length: Some(m.file_length),
+                    height: Some(*height),
+                    width: Some(*width),
+                    media_key: Some(m.media_key.clone()),
+                    file_enc_sha256: Some(m.file_enc_sha256.clone()),
+                    direct_path: Some(m.direct_path.clone()),
+                    jpeg_thumbnail: thumbnail.clone(),
+                    context_info: ctx(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }
+        }
+        Content::Document {
+            file_name,
+            mimetype,
+            pages,
+            caption,
+            media,
+            ..
+        } => {
+            let m = usable(media)?;
+            wa::Message {
+                document_message: buffa_some(wa::message::DocumentMessage {
+                    url: url(&m),
+                    mimetype: Some(mimetype.clone()),
+                    title: Some(file_name.clone()),
+                    file_name: Some(file_name.clone()),
+                    file_sha256: Some(m.file_sha256.clone()),
+                    file_length: Some(m.file_length),
+                    page_count: *pages,
+                    media_key: Some(m.media_key.clone()),
+                    file_enc_sha256: Some(m.file_enc_sha256.clone()),
+                    direct_path: Some(m.direct_path.clone()),
+                    caption: caption.clone(),
+                    context_info: ctx(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }
+        }
+        Content::Voice {
+            seconds,
+            ptt,
+            waveform,
+            media,
+        } => {
+            let m = usable(media)?;
+            wa::Message {
+                audio_message: buffa_some(wa::message::AudioMessage {
+                    url: url(&m),
+                    mimetype: Some(m.mimetype.clone()),
+                    file_sha256: Some(m.file_sha256.clone()),
+                    file_length: Some(m.file_length),
+                    seconds: Some(*seconds),
+                    ptt: Some(*ptt),
+                    media_key: Some(m.media_key.clone()),
+                    file_enc_sha256: Some(m.file_enc_sha256.clone()),
+                    direct_path: Some(m.direct_path.clone()),
+                    waveform: (!waveform.is_empty()).then(|| waveform.clone()),
+                    context_info: ctx(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }
+        }
+        Content::Video {
+            caption,
+            seconds,
+            width,
+            height,
+            thumbnail,
+            media,
+            gif,
+        } => {
+            let m = usable(media)?;
+            wa::Message {
+                video_message: buffa_some(wa::message::VideoMessage {
+                    gif_playback: gif.then_some(true),
+                    url: url(&m),
+                    mimetype: Some(m.mimetype.clone()),
+                    file_sha256: Some(m.file_sha256.clone()),
+                    file_length: Some(m.file_length),
+                    seconds: Some(*seconds),
+                    media_key: Some(m.media_key.clone()),
+                    caption: caption.clone(),
+                    height: Some(*height),
+                    width: Some(*width),
+                    file_enc_sha256: Some(m.file_enc_sha256.clone()),
+                    direct_path: Some(m.direct_path.clone()),
+                    jpeg_thumbnail: thumbnail.clone(),
+                    context_info: ctx(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }
+        }
+        Content::Sticker {
+            width,
+            height,
+            animated,
+            media,
+        } => {
+            let m = usable(media)?;
+            wa::Message {
+                sticker_message: buffa_some(wa::message::StickerMessage {
+                    url: url(&m),
+                    file_sha256: Some(m.file_sha256.clone()),
+                    file_enc_sha256: Some(m.file_enc_sha256.clone()),
+                    media_key: Some(m.media_key.clone()),
+                    mimetype: Some(m.mimetype.clone()),
+                    height: Some(*height),
+                    width: Some(*width),
+                    direct_path: Some(m.direct_path.clone()),
+                    file_length: Some(m.file_length),
+                    is_animated: Some(*animated),
+                    context_info: ctx(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }
+        }
+        Content::Unsupported(_) | Content::ViewOnce | Content::Deleted | Content::Call(_) => {
+            return None;
+        }
+    };
+    Some(*msg.prepare_for_forward())
 }
 
 /// The `contextInfo` of whichever body the message carries.
@@ -621,6 +825,7 @@ pub fn message_from_envelope(env: &Envelope, msg: &wa::Message) -> Option<Messag
             q
         }),
         edited: false,
+        forwarded: forward_from_wa(msg),
         reactions: Vec::new(),
         mentions: mentions_from_wa(msg),
     })
@@ -738,6 +943,7 @@ pub fn message_from_web_info(
             .map(|s| timestamp + s as i64),
         reply: wmi.message.as_option().and_then(quote_from_wa),
         edited: false,
+        forwarded: wmi.message.as_option().and_then(forward_from_wa),
         reactions: wmi
             .reactions
             .iter()
@@ -789,7 +995,14 @@ pub fn chat_from_conversation(conv: &wa::Conversation, now: i64) -> ChatMeta {
         last_ts,
         pinned: conv.pinned.unwrap_or_default() > 0,
         archived: conv.archived.unwrap_or(false),
-        muted: conv.mute_end_time.is_some_and(|t| t as i64 > now),
+        // `u64::MAX` (-1) means "forever"; an expired mute is not muted.
+        mute_end: match conv.mute_end_time.map(|t| t as i64) {
+            Some(t) if t != 0 => match mute_end_secs(t) {
+                end if mute_active(end, now) => end,
+                _ => MUTE_OFF,
+            },
+            _ => MUTE_OFF,
+        },
     }
 }
 
@@ -928,6 +1141,7 @@ pub fn build_media(media: &OutgoingMedia, up: &Uploaded) -> (wa::Message, Conten
     let kind = match media.kind {
         OutgoingKind::Image { .. } => MediaKind::Image,
         OutgoingKind::Document => MediaKind::Document,
+        OutgoingKind::Video { .. } => MediaKind::Video,
         OutgoingKind::Voice { .. } => MediaKind::Audio,
     };
     let mref = MediaRef {
@@ -976,6 +1190,33 @@ pub fn build_media(media: &OutgoingMedia, up: &Uploaded) -> (wa::Message, Conten
                 direct_path: Some(up.direct_path.clone()),
                 media_key_timestamp: Some(up.media_key_timestamp),
                 caption: media.caption.clone(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        OutgoingKind::Video {
+            seconds,
+            width,
+            height,
+            thumbnail,
+            gif,
+        } => wa::Message {
+            video_message: buffa_some(wa::message::VideoMessage {
+                url: Some(up.url.clone()),
+                mimetype: Some(media.mimetype.clone()),
+                caption: media.caption.clone(),
+                file_sha256: Some(up.file_sha256.clone()),
+                file_length: Some(up.file_length),
+                seconds: Some(*seconds),
+                height: Some(*height),
+                width: Some(*width),
+                media_key: Some(up.media_key.clone()),
+                file_enc_sha256: Some(up.file_enc_sha256.clone()),
+                direct_path: Some(up.direct_path.clone()),
+                media_key_timestamp: Some(up.media_key_timestamp),
+                jpeg_thumbnail: Some(thumbnail.clone()),
+                streaming_sidecar: up.streaming_sidecar.clone(),
+                gif_playback: gif.then_some(true),
                 ..Default::default()
             }),
             ..Default::default()
@@ -1035,6 +1276,149 @@ mod tests {
         assert!(parse_incoming(&e, &msg).is_none());
         e.chat = "34600111222@s.whatsapp.net".into();
         assert!(parse_incoming(&e, &msg).is_some());
+    }
+
+    fn mref(kind: MediaKind) -> MediaRef {
+        MediaRef {
+            direct_path: "/v/t62/abc".into(),
+            media_key: vec![1; 32],
+            file_sha256: vec![2; 32],
+            file_enc_sha256: vec![3; 32],
+            file_length: 1234,
+            kind,
+            mimetype: "image/jpeg".into(),
+        }
+    }
+
+    fn forward_ctx(m: &wa::Message) -> (Option<bool>, Option<u32>) {
+        let c = context_info(m).unwrap();
+        (c.is_forwarded, c.forwarding_score)
+    }
+
+    #[test]
+    fn forwarded_mark_is_read_from_the_context() {
+        let mut m = build_forward(&Content::Text("hi".into()), None).unwrap();
+        assert_eq!(forward_from_wa(&m), Some(0));
+        assert_eq!(forward_from_wa(&build_text("hi")), None);
+        let ctx = m
+            .extended_text_message
+            .as_option_mut()
+            .unwrap()
+            .context_info
+            .as_option_mut()
+            .unwrap();
+        ctx.is_forwarded = None;
+        ctx.forwarding_score = Some(3);
+        assert_eq!(forward_from_wa(&m), Some(3));
+        let msg = message_from_envelope(&env(false), &m).unwrap();
+        assert_eq!(msg.forwarded, Some(3));
+    }
+
+    #[test]
+    fn forwards_bump_the_score_like_the_official_client() {
+        let text = Content::Text("hi".into());
+        // First forward: marked, score 0; a forward of a forward: +1; from 5
+        // on the "frequently forwarded" sentinel.
+        assert_eq!(
+            forward_ctx(&build_forward(&text, None).unwrap()),
+            (Some(true), Some(0))
+        );
+        assert_eq!(
+            forward_ctx(&build_forward(&text, Some(0)).unwrap()),
+            (Some(true), Some(1))
+        );
+        assert_eq!(
+            forward_ctx(&build_forward(&text, Some(4)).unwrap()),
+            (Some(true), Some(127))
+        );
+        // The domain helper agrees.
+        let mut m = message_from_envelope(&env(false), &build_text("x")).unwrap();
+        for (src, next) in [
+            (None, 0),
+            (Some(0), 1),
+            (Some(3), 4),
+            (Some(4), 127),
+            (Some(127), 127),
+        ] {
+            m.forwarded = src;
+            assert_eq!(m.forward_score(), next, "{src:?}");
+            let sent = build_forward(&m.content, src).unwrap();
+            assert_eq!(forward_from_wa(&sent), Some(next));
+        }
+    }
+
+    #[test]
+    fn forwarded_media_reuses_the_cdn_blob() {
+        let img = Content::Image {
+            caption: Some("sunset".into()),
+            width: 640,
+            height: 420,
+            thumbnail: Some(vec![9, 9]),
+            media: Some(mref(MediaKind::Image)),
+        };
+        let m = build_forward(&img, None).unwrap();
+        let i = m.image_message.as_option().unwrap();
+        assert_eq!(i.direct_path.as_deref(), Some("/v/t62/abc"));
+        assert_eq!(i.url.as_deref(), Some("https://mmg.whatsapp.net/v/t62/abc"));
+        assert_eq!(i.media_key.as_deref(), Some(&[1u8; 32][..]));
+        assert_eq!(i.jpeg_thumbnail.as_deref(), Some(&[9u8, 9][..]));
+        // What arrives reads back as the same content.
+        assert_eq!(content_from_wa(&m), Some(img));
+        let voice = Content::Voice {
+            seconds: 4,
+            ptt: true,
+            waveform: vec![10; 64],
+            media: Some(mref(MediaKind::Audio)),
+        };
+        let back = content_from_wa(&build_forward(&voice, Some(0)).unwrap()).unwrap();
+        assert!(matches!(
+            back,
+            Content::Voice {
+                ptt: true,
+                seconds: 4,
+                ..
+            }
+        ));
+        let link = Content::Link {
+            text: "look https://example.com".into(),
+            preview: LinkPreview {
+                url: "https://example.com".into(),
+                title: "Example".into(),
+                description: "d".into(),
+                thumbnail: None,
+            },
+        };
+        assert_eq!(
+            content_from_wa(&build_forward(&link, None).unwrap()),
+            Some(link)
+        );
+    }
+
+    #[test]
+    fn what_cannot_be_forwarded_builds_nothing() {
+        assert!(build_forward(&Content::Deleted, None).is_none());
+        assert!(build_forward(&Content::ViewOnce, None).is_none());
+        assert!(build_forward(&Content::Unsupported("poll".into()), None).is_none());
+        let no_media = Content::Document {
+            file_name: "a.pdf".into(),
+            mimetype: "application/pdf".into(),
+            size: 1,
+            pages: None,
+            caption: None,
+            media: None,
+        };
+        assert!(build_forward(&no_media, None).is_none());
+        let mut no_key = mref(MediaKind::Document);
+        no_key.media_key.clear();
+        let no_key = Content::Document {
+            file_name: "a.pdf".into(),
+            mimetype: "application/pdf".into(),
+            size: 1,
+            pages: None,
+            caption: None,
+            media: Some(no_key),
+        };
+        assert!(build_forward(&no_key, None).is_none());
     }
 
     #[test]
@@ -1156,6 +1540,50 @@ mod tests {
                 assert_eq!(media.unwrap().direct_path, "/v/t62/x");
             }
             other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn videos_and_gifs_roundtrip_and_forward_as_gifs() {
+        let up = Uploaded {
+            url: "https://mmg.whatsapp.net/v".into(),
+            direct_path: "/v/t62/v".into(),
+            media_key: vec![7; 32],
+            file_sha256: vec![1; 32],
+            file_enc_sha256: vec![2; 32],
+            file_length: 9,
+            media_key_timestamp: 1,
+            streaming_sidecar: None,
+        };
+        for gif in [false, true] {
+            let media = OutgoingMedia {
+                kind: OutgoingKind::Video {
+                    seconds: 4,
+                    width: 640,
+                    height: 360,
+                    thumbnail: vec![5, 5],
+                    gif,
+                },
+                bytes: vec![0; 9],
+                file_name: "clip.mp4".into(),
+                mimetype: "video/mp4".into(),
+                caption: Some("hey".into()),
+            };
+            let (msg, local) = build_media(&media, &up);
+            let v = msg.video_message.as_option().unwrap();
+            assert_eq!(v.gif_playback, gif.then_some(true));
+            assert_eq!(v.seconds, Some(4));
+            assert_eq!(v.jpeg_thumbnail.as_deref(), Some(&[5u8, 5][..]));
+            let parsed = content_from_wa(&msg).unwrap();
+            assert_eq!(parsed, local);
+            assert!(matches!(parsed, Content::Video { gif: g, .. } if g == gif));
+            assert_eq!(parsed.media().unwrap().kind, MediaKind::Video);
+            // A forwarded GIF is still a GIF.
+            let fwd = build_forward(&parsed, None).unwrap();
+            assert_eq!(
+                fwd.video_message.as_option().unwrap().gif_playback,
+                gif.then_some(true)
+            );
         }
     }
 
@@ -1810,11 +2238,20 @@ mod name_and_list_tests {
             mute_end_timestamp: Some(end),
             ..Default::default()
         };
-        assert_eq!(mute_flag(&mute(true, -1), 1000), ChatFlag::Muted(true));
-        assert_eq!(mute_flag(&mute(true, 2000), 1000), ChatFlag::Muted(true));
-        // The mute already expired.
-        assert_eq!(mute_flag(&mute(true, 500), 1000), ChatFlag::Muted(false));
-        assert_eq!(mute_flag(&mute(false, 0), 1000), ChatFlag::Muted(false));
+        assert_eq!(mute_flag(&mute(true, -1)), ChatFlag::Muted(MUTE_FOREVER));
+        // Sync actions count in milliseconds; the app keeps seconds.
+        assert_eq!(
+            mute_flag(&mute(true, 1_800_000_000_000)),
+            ChatFlag::Muted(1_800_000_000)
+        );
+        assert_eq!(mute_flag(&mute(false, 0)), ChatFlag::Muted(MUTE_OFF));
+        assert_eq!(mute_end_secs(1_800_000_000), 1_800_000_000);
+        assert_eq!(mute_end_secs(0), MUTE_FOREVER);
+        // An 8 hour mute set long ago is over.
+        assert!(!mute_active(
+            mute_end_secs(1_000_000_000_000),
+            1_800_000_000
+        ));
     }
 
     #[test]

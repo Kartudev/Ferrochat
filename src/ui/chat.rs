@@ -2,8 +2,8 @@
 
 use iced::widget::text::Wrapping;
 use iced::widget::{
-    Space, button, center, column, container, image, mouse_area, opaque, row, scrollable, text,
-    text_input,
+    Space, button, center, checkbox, column, container, image, mouse_area, opaque, row, scrollable,
+    text, text_input,
 };
 use iced::{Alignment, Color, ContentFit, Length};
 
@@ -14,6 +14,7 @@ use super::{
     El, avatar_for, clock, day_separator, fill, gap, icon, last_seen_label, local_day, tail, ticks,
 };
 use crate::app::composer;
+use crate::app::forward::Fwd;
 use crate::app::live::typing_label;
 use crate::app::state::{Conversation, reaction_summary};
 use crate::app::{
@@ -69,6 +70,48 @@ pub fn empty(app: &App) -> El<'_> {
 
 /// The open conversation.
 pub fn view<'a>(app: &'a App, conv: &'a Conversation) -> El<'a> {
+    let el = view_inner(app, conv);
+    if !app.drop.hovering {
+        return el;
+    }
+    iced::widget::stack![el, drop_overlay(app)].into()
+}
+
+/// Shown over the conversation while files are dragged over the window.
+fn drop_overlay(app: &App) -> El<'_> {
+    let t = &app.theme;
+    let p = t.palette;
+    let m = t.metrics;
+    let card = container(
+        column![
+            icon(Icon::Paperclip, 44.0, p.accent),
+            text("Drop files here to send them")
+                .size(m.text + 3.0)
+                .color(p.text_primary),
+            text("Photos, videos, GIFs and documents")
+                .size(m.text - 1.0)
+                .color(p.text_secondary),
+        ]
+        .spacing(12)
+        .align_x(Alignment::Center),
+    )
+    .padding([36, 48])
+    .style(move |th: &iced::Theme| {
+        let mut s = theme::rounded(p.bg_elevated, 16.0)(th);
+        s.border = iced::Border {
+            color: p.accent,
+            width: 2.0,
+            radius: 16.0.into(),
+        };
+        s
+    });
+    container(card)
+        .center(Length::Fill)
+        .style(theme::solid(Color::from_rgba(0.0, 0.0, 0.0, 0.55)))
+        .into()
+}
+
+fn view_inner<'a>(app: &'a App, conv: &'a Conversation) -> El<'a> {
     let t = &app.theme;
     let p = t.palette;
     let m = t.metrics;
@@ -297,14 +340,66 @@ pub fn view<'a>(app: &'a App, conv: &'a Conversation) -> El<'a> {
         layers.push(popup_layer(app, msg, *which, pos));
     }
     body = body.push(iced::widget::stack(layers));
+    if let Some(sel) = app.selection.as_ref().filter(|s| s.chat == conv.chat) {
+        return with_info(app, conv, body.push(selection_bar(app, sel)).into());
+    }
     if let Some(bar) = reply_bar(app, conv) {
         body = body.push(bar);
     }
     with_info(app, conv, body.push(composer(app)).into())
 }
 
+/// Replaces the composer in selection mode: close, count, forward.
+fn selection_bar<'a>(app: &'a App, sel: &'a crate::app::forward::Selection) -> El<'a> {
+    let t = &app.theme;
+    let p = t.palette;
+    let m = t.metrics;
+    let n = sel.ids.len();
+    let mut fwd = button(icon(
+        Icon::Forward,
+        m.icon,
+        if n > 0 {
+            p.text_primary
+        } else {
+            p.text_secondary
+        },
+    ))
+    .padding(8)
+    .style(theme::icon_button(t, false));
+    if n > 0 {
+        fwd = fwd.on_press(Message::Ui(Ui::Forward(Fwd::Selected)));
+    }
+    container(
+        row![
+            button(icon(Icon::X, m.icon, p.text_secondary))
+                .padding(8)
+                .style(theme::icon_button(t, false))
+                .on_press(Message::Ui(Ui::Forward(Fwd::CancelSelect))),
+            text(format!("{n} selected")).size(15).color(p.text_primary),
+            fill(),
+            fwd,
+        ]
+        .spacing(14)
+        .align_y(Alignment::Center),
+    )
+    .height(62)
+    .align_y(Alignment::Center)
+    .padding([8, 16])
+    .style(theme::solid(p.bg_elevated))
+    .into()
+}
+
 /// The conversation with the info drawer on its right, when open.
 fn with_info<'a>(app: &'a App, conv: &'a Conversation, el: El<'a>) -> El<'a> {
+    if let Some(mi) = app.msg_info.as_ref().filter(|i| i.chat == conv.chat)
+        && let Some(msg) = conv.get(&mi.id)
+    {
+        return row![
+            container(el).width(Length::Fill).height(Length::Fill),
+            super::msg_info::view(app, msg)
+        ]
+        .into();
+    }
     match app.info.as_ref().filter(|i| i.chat == conv.chat) {
         Some(info) => row![
             container(el).width(Length::Fill).height(Length::Fill),
@@ -327,9 +422,11 @@ fn popup_layer<'a>(
     let (card, card_h) = match which {
         Popup::Reactions => (reaction_picker(app, msg), 52.0),
         Popup::Menu => {
-            // Reply, React, Copy, Star, Delete.
-            let items = 5
+            // Reply, React, Copy, Star, Select messages, Delete.
+            let items = 6
+                + usize::from(msg.can_forward())
                 + usize::from(msg.can_edit(now))
+                + usize::from(msg.from_me)
                 + usize::from(matches!(msg.content, Content::Video { .. }));
             (message_menu(app, msg), 12.0 + 38.0 * items as f32)
         }
@@ -535,7 +632,34 @@ fn attach_preview<'a>(app: &'a App, a: &'a crate::app::paste::AttachPreview) -> 
     .align_y(Alignment::Center)
     .padding([8, 16]);
     let content: El<'a> = match &a.handle {
-        Some(h) => image(h.clone()).content_fit(ContentFit::ScaleDown).into(),
+        Some(h) => match &first.kind {
+            crate::net::OutgoingKind::Video { seconds, gif, .. } => {
+                // The first frame with what WhatsApp shows on a video: a
+                // play mark and the duration, or "GIF".
+                let shade = Color::from_rgba(0.0, 0.0, 0.0, 0.55);
+                let label: El<'a> = if *gif {
+                    text("GIF").size(13).color(Color::WHITE).into()
+                } else {
+                    row![
+                        icon(Icon::Video, 13.0, Color::WHITE),
+                        text(format_duration(*seconds)).size(13).color(Color::WHITE),
+                    ]
+                    .spacing(5)
+                    .align_y(Alignment::Center)
+                    .into()
+                };
+                column![
+                    image(h.clone()).content_fit(ContentFit::ScaleDown),
+                    container(label)
+                        .padding([3, 9])
+                        .style(theme::rounded(shade, 10.0)),
+                ]
+                .spacing(10)
+                .align_x(Alignment::Center)
+                .into()
+            }
+            _ => image(h.clone()).content_fit(ContentFit::ScaleDown).into(),
+        },
         None => column![
             icon(Icon::FileText, 72.0, p.text_secondary),
             text(first.file_name.clone())
@@ -694,6 +818,36 @@ fn meta_row<'a>(t: &FerroTheme, msg: &ChatMessage) -> El<'a> {
     r.into()
 }
 
+/// "Forwarded" / "Forwarded many times" above the content, like the
+/// official client (one arrow, two for frequently forwarded messages).
+fn forwarded_label<'a>(t: &FerroTheme, msg: &ChatMessage) -> El<'a> {
+    let p = t.palette;
+    let color = if msg.from_me {
+        p.bubble_out_meta
+    } else {
+        p.text_secondary
+    };
+    let many = msg.frequently_forwarded();
+    let mut arrows = row![icon(Icon::Forward, 14.0, color)];
+    if many {
+        arrows = arrows.push(icon(Icon::Forward, 14.0, color));
+    }
+    row![
+        arrows,
+        text(if many {
+            "Forwarded many times"
+        } else {
+            "Forwarded"
+        })
+        .size(12.5)
+        .font(theme::INTER)
+        .color(color)
+    ]
+    .spacing(4)
+    .align_y(Alignment::Center)
+    .into()
+}
+
 fn bubble<'a>(app: &'a App, msg: &'a ChatMessage, first: bool, group: bool) -> El<'a> {
     let t = &app.theme;
     let p = t.palette;
@@ -713,6 +867,10 @@ fn bubble<'a>(app: &'a App, msg: &'a ChatMessage, first: bool, group: bool) -> E
             INTER_MEDIUM,
             false,
         ));
+    }
+
+    if msg.forwarded.is_some() && !matches!(msg.content, Content::Deleted) {
+        col = col.push(forwarded_label(t, msg));
     }
 
     if let Some(q) = &msg.reply
@@ -924,6 +1082,7 @@ fn bubble<'a>(app: &'a App, msg: &'a ChatMessage, first: bool, group: bool) -> E
             seconds,
             width,
             height,
+            gif,
             ..
         } => {
             let (w, h) = fit(*width, *height, 330.0, 330.0);
@@ -947,14 +1106,19 @@ fn bubble<'a>(app: &'a App, msg: &'a ChatMessage, first: bool, group: bool) -> E
             let play = container(icon(Icon::Play, 26.0, Color::WHITE))
                 .padding(14)
                 .style(theme::rounded(shade, 30.0));
-            let badge = container(
+            // GIFs say so instead of a duration, like WhatsApp.
+            let badge_label: El<'a> = if *gif {
+                text("GIF").size(12).color(Color::WHITE).into()
+            } else {
                 row![
                     icon(Icon::Video, 12.0, Color::WHITE),
                     text(format_duration(*seconds)).size(12).color(Color::WHITE),
                 ]
                 .spacing(4)
-                .align_y(Alignment::Center),
-            )
+                .align_y(Alignment::Center)
+                .into()
+            };
+            let badge = container(badge_label)
             .padding([2, 7])
             .style(theme::rounded(shade, 9.0));
             let layered = iced::widget::stack![
@@ -1105,8 +1269,10 @@ fn finish<'a>(app: &'a App, msg: &'a ChatMessage, first: bool, content: El<'a>) 
         .as_ref()
         .filter(|(id, _)| *id == msg.id)
         .map(|(_, w)| *w);
-    let show_actions =
-        !deleted && (app.hovered.as_deref() == Some(msg.id.as_str()) || popup.is_some());
+    let selecting = app.selection.as_ref().filter(|s| s.chat == msg.chat);
+    let show_actions = selecting.is_none()
+        && !deleted
+        && (app.hovered.as_deref() == Some(msg.id.as_str()) || popup.is_some());
     let actions = action_slot(app, msg, show_actions, deleted);
     let line = if out {
         row![fill(), actions, bubble, tail_or_gap]
@@ -1122,8 +1288,36 @@ fn finish<'a>(app: &'a App, msg: &'a ChatMessage, first: bool, content: El<'a>) 
             row![gap(20.0), badge, fill()]
         });
     }
-    let highlighted = app.highlight.as_ref().is_some_and(|(id, _)| *id == msg.id);
-    let hl = p.accent.scale_alpha(0.22);
+    let selected = selecting.is_some_and(|s| s.contains(&msg.id));
+    let highlighted = selected || app.highlight.as_ref().is_some_and(|(id, _)| *id == msg.id);
+    let hl = p.accent.scale_alpha(if selected { 0.12 } else { 0.22 });
+    let stack: El<'a> = if selecting.is_some() {
+        // Selection mode: a checkbox in front of every row that can be
+        // forwarded; the row itself is covered by a click catcher (below).
+        let check: El<'a> = if msg.can_forward() {
+            let id = msg.id.clone();
+            checkbox(selected)
+                .on_toggle(move |_| Message::Ui(Ui::Forward(Fwd::Toggle(id.clone()))))
+                .size(18)
+                .style(theme::checkbox(t))
+                .into()
+        } else {
+            Space::new().into()
+        };
+        row![
+            container(check)
+                .width(SELECT_SLOT_W)
+                .padding(iced::Padding {
+                    left: 4.0,
+                    ..Default::default()
+                }),
+            stack
+        ]
+        .align_y(Alignment::Center)
+        .into()
+    } else {
+        stack.into()
+    };
     let row_el = container(stack)
         .id(row_id(&msg.id))
         .width(Length::Fill)
@@ -1136,12 +1330,21 @@ fn finish<'a>(app: &'a App, msg: &'a ChatMessage, first: bool, content: El<'a>) 
             ..Default::default()
         });
     let id = msg.id.clone();
+    if selecting.is_some() {
+        // Any click on the row toggles it, even on a picture or a link.
+        let catcher = mouse_area(Space::new().width(Length::Fill).height(Length::Fill))
+            .on_press(Message::Ui(Ui::Forward(Fwd::Toggle(id))));
+        return iced::widget::stack![row_el, catcher].into();
+    }
     mouse_area(row_el)
         .on_enter(Message::Ui(Ui::HoverMessage(id.clone())))
         .on_exit(Message::Ui(Ui::UnhoverMessage(id.clone())))
         .on_right_press(Message::Ui(Ui::ToggleMessageMenu(id)))
         .into()
 }
+
+/// Width of the checkbox column in selection mode.
+pub const SELECT_SLOT_W: f32 = 36.0;
 
 /// Width of the slot reserved next to every bubble for the hover buttons.
 pub const ACTION_SLOT_W: f32 = 2.0 * ACTION_BTN + 2.0 + 8.0;
@@ -1261,6 +1464,20 @@ fn message_menu<'a>(app: &'a App, msg: &'a ChatMessage) -> El<'a> {
         Ui::ToggleReactionPicker(id.clone()),
     ));
     col = col.push(item(Icon::Copy, "Copy", Ui::CopyText(id.clone())));
+    if msg.can_forward() {
+        col = col.push(item(
+            Icon::Forward,
+            "Forward",
+            Ui::Forward(Fwd::One(id.clone())),
+        ));
+    }
+    if msg.from_me {
+        col = col.push(item(
+            Icon::Info,
+            "Message info",
+            Ui::MessageInfo(id.clone()),
+        ));
+    }
     let starred = app.is_starred(&msg.chat, &msg.id);
     col = col.push(item(
         if starred { Icon::StarOff } else { Icon::Star },
@@ -1277,8 +1494,13 @@ fn message_menu<'a>(app: &'a App, msg: &'a ChatMessage) -> El<'a> {
     if msg.can_edit(now) {
         col = col.push(item(Icon::Pencil, "Edit", Ui::StartEdit(id.clone())));
     }
+    col = col.push(item(
+        Icon::Check,
+        "Select messages",
+        Ui::Forward(Fwd::Select(id.clone())),
+    ));
     col = col.push(item(Icon::Trash2, "Delete", Ui::AskDelete(id)));
-    container(col.width(190))
+    container(col.width(210))
         .padding([6, 0])
         .style(move |th: &iced::Theme| {
             let mut s = theme::rounded(p.bg_elevated, 8.0)(th);
@@ -2026,6 +2248,7 @@ mod layout_tests {
             expires_at: None,
             reply: None,
             edited: false,
+            forwarded: None,
             mentions: Vec::new(),
             reactions: Vec::new(),
         }

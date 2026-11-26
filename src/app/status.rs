@@ -660,7 +660,7 @@ impl App {
         let dir = self.video_dir();
         let sid = id.to_string();
         Task::perform(
-            super::video::fetch_video_file(client, mref, dir),
+            super::video::fetch_video_file(client, mref, dir, None),
             move |result| Message::done(Done::VideoFile { id: sid, result }),
         )
     }

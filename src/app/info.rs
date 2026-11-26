@@ -11,9 +11,9 @@
 use iced::Task;
 use iced::widget::image;
 
+use super::App;
 use super::message::{Done, Message, Ui};
-use super::{App, store_task};
-use crate::net::{self, ChatFlag, ContactInfo, Content, GroupInfo, Message as ChatMessage};
+use crate::net::{self, ContactInfo, Content, GroupInfo, Message as ChatMessage};
 
 /// Most gallery entries loaded per tab.
 pub const GALLERY_LIMIT: usize = 120;
@@ -193,6 +193,7 @@ impl App {
             return Task::none();
         }
         self.popup = None;
+        self.msg_info = None;
         self.info = Some(InfoPanel::new(chat.clone()));
         let group = net::is_group_jid(&chat);
         let done = |d: InfoDone| Message::done(Done::Info(Box::new(d)));
@@ -367,8 +368,15 @@ impl App {
                 )
             }
             Ui::ToggleMute(chat) => {
-                let now = self.chats.get(&chat).is_some_and(|e| e.meta.muted);
-                self.set_mute(chat, !now)
+                // Unmutes at once; muting asks for how long, like the
+                // official client.
+                if self.is_muted(&chat) {
+                    self.set_mute(chat, crate::net::MUTE_OFF)
+                } else {
+                    return self.on_ui_chat_actions(Ui::ChatAct(
+                        super::chat_actions::ChatAct::AskMute(chat),
+                    ));
+                }
             }
             Ui::AskBlock => {
                 if let Some(i) = &mut self.info {
@@ -406,35 +414,6 @@ impl App {
             }
             other => return Err(other),
         })
-    }
-
-    /// Optimistic mute / unmute (forever, like "Always" in the official
-    /// mute dialog): apply, persist, send, revert on failure.
-    fn set_mute(&mut self, chat: String, muted: bool) -> Task<Message> {
-        let flag = ChatFlag::Muted(muted);
-        let undo = ChatFlag::Muted(!muted);
-        self.chats.apply_flag(&chat, flag);
-        let persist = {
-            let chat = chat.clone();
-            store_task(&self.store, move |s| s.set_chat_flag(&chat, flag))
-        };
-        let Some(client) = self.client.clone() else {
-            return persist;
-        };
-        let send = Task::perform(
-            async move {
-                let r = client
-                    .set_muted(&chat, muted)
-                    .await
-                    .map_err(|e| e.to_string());
-                (chat, r)
-            },
-            move |(chat, r)| match r {
-                Ok(()) => Message::done(Done::Nothing),
-                Err(error) => Message::done(Done::FlagFailed { chat, undo, error }),
-            },
-        );
-        Task::batch([persist, send])
     }
 }
 

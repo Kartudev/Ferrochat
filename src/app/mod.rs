@@ -3,26 +3,39 @@
 mod actions;
 pub mod call;
 pub mod composer;
+pub mod drop;
 pub mod emoji;
 pub mod info;
 pub mod input;
 pub mod linkify;
 pub mod lists;
+pub mod media_fetch;
+pub mod msg_info;
 pub mod video;
 pub mod viewer;
 pub use actions::{PopupPos, popup_top, row_id};
 mod background;
+pub mod chat_actions;
+pub mod forward;
 pub use background::WindowGeom;
 #[cfg(test)]
 mod call_flows;
 #[cfg(test)]
+mod chat_action_flows;
+#[cfg(test)]
 mod flows;
+#[cfg(test)]
+mod forward_flows;
 pub mod live;
+#[cfg(test)]
+mod media_flows;
 pub mod message;
 pub mod nav;
 pub mod paste;
 #[cfg(test)]
 mod perf;
+#[cfg(test)]
+mod reupload_flows;
 #[cfg(test)]
 mod social_flows;
 pub mod state;
@@ -211,6 +224,12 @@ pub struct App {
     pub(crate) sidebar_menu: Option<SidebarMenu>,
     /// Create / rename / delete list dialog.
     pub(crate) list_dialog: Option<ListDialog>,
+    /// Mute / clear / delete chat dialog.
+    pub(crate) chat_dialog: Option<chat_actions::ChatDialog>,
+    /// "Select messages" mode of the open conversation.
+    pub(crate) selection: Option<forward::Selection>,
+    /// "Forward message to" dialog.
+    pub(crate) forward: Option<forward::ForwardDialog>,
     pub(crate) open: Option<Conversation>,
     pending_read: usize,
     /// Display JID -> the JID messages came from (LID-addressed chats and
@@ -224,6 +243,12 @@ pub struct App {
     pub(crate) emoji: emoji::Picker,
     /// Attachment preview (picked or pasted media waiting for "send").
     pub(crate) attach: Option<paste::AttachPreview>,
+    /// Files dragged over / dropped on the window.
+    pub(crate) drop: drop::DropState,
+    /// The "Message info" panel.
+    pub(crate) msg_info: Option<msg_info::MsgInfo>,
+    /// Re-uploaded media waiting to be applied to the open conversation.
+    pub(crate) fresh_media: media_fetch::FreshMedia,
     pub(crate) menu_open: bool,
     pub(crate) qr: Option<image::Handle>,
     pub(crate) images: ByteLru<String, image::Handle>,
@@ -519,6 +544,9 @@ impl App {
             resync: Resync::default(),
             sidebar_menu: None,
             list_dialog: None,
+            chat_dialog: None,
+            selection: None,
+            forward: None,
             open: None,
             pending_read: 0,
             wire: HashMap::new(),
@@ -530,6 +558,9 @@ impl App {
                 ..Default::default()
             },
             attach: None,
+            drop: drop::DropState::default(),
+            fresh_media: Default::default(),
+            msg_info: None,
             menu_open: false,
             qr: None,
             images: ByteLru::new(IMAGE_BUDGET),
@@ -628,11 +659,15 @@ impl App {
                     Some((ScreenshotTarget::Video, _)) => 9000,
                     // Encodes a photo after the history loads.
                     Some((ScreenshotTarget::Paste, _)) => 6000,
+                    // The helper probes / converts the file.
+                    Some((ScreenshotTarget::AttachVideo | ScreenshotTarget::AttachGif, _)) => 9000,
                     Some((
                         ScreenshotTarget::Emoji
                         | ScreenshotTarget::Viewer
                         | ScreenshotTarget::Info
-                        | ScreenshotTarget::GroupInfo,
+                        | ScreenshotTarget::GroupInfo
+                        | ScreenshotTarget::MessageInfo
+                        | ScreenshotTarget::GroupMessageInfo,
                         _,
                     )) => 5000,
                     // Call bubbles are stored, then the call rings.
@@ -686,6 +721,16 @@ impl App {
                 }
                 iced::Event::Window(iced::window::Event::Moved(p)) => {
                     Some(Message::WindowMoved(id, p))
+                }
+                // Drag and drop (X11 / XWayland, Windows, macOS).
+                iced::Event::Window(iced::window::Event::FileHovered(_)) => {
+                    Some(Message::Ui(Ui::Drop(drop::DropMsg::Hovered)))
+                }
+                iced::Event::Window(iced::window::Event::FilesHoveredLeft) => {
+                    Some(Message::Ui(Ui::Drop(drop::DropMsg::Left)))
+                }
+                iced::Event::Window(iced::window::Event::FileDropped(path)) => {
+                    Some(Message::Ui(Ui::Drop(drop::DropMsg::Dropped(path))))
                 }
                 iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
                     key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape),
@@ -775,6 +820,7 @@ impl App {
 
     /// The only mutation point. Pushes the tray model afterwards.
     pub fn update(&mut self, message: Message) -> Task<Message> {
+        self.apply_fresh_media();
         let task = self.update_inner(message);
         self.sync_tray();
         task
@@ -844,6 +890,18 @@ impl App {
         if let Ui::Call(c) = ui {
             return self.on_call_ui(c);
         }
+        let ui = match self.on_ui_forward(ui) {
+            Ok(task) => return task,
+            Err(ui) => ui,
+        };
+        let ui = match self.on_ui_msg_info(ui) {
+            Ok(task) => return task,
+            Err(ui) => ui,
+        };
+        let ui = match self.on_ui_drop(ui) {
+            Ok(task) => return task,
+            Err(ui) => ui,
+        };
         let ui = match self.on_ui_extra(ui) {
             Ok(task) => return task,
             Err(ui) => ui,
@@ -874,6 +932,8 @@ impl App {
                 let consumed = self.nav_escape()
                     || std::mem::take(&mut self.settings_open)
                     || self.list_dialog.take().is_some()
+                    || self.chat_dialog.take().is_some()
+                    || self.forward.take().is_some()
                     || self.sidebar_menu.take().is_some()
                     || self.dialog.take().is_some()
                     || self.attach.take().is_some()
@@ -883,8 +943,10 @@ impl App {
                         true
                     }
                     || self.viewer.take().is_some()
+                    || self.msg_info.take().is_some()
                     || self.info.take().is_some()
                     || self.chat_search.take().is_some()
+                    || self.selection.take().is_some()
                     || self.reply_to.take().is_some()
                     || (self.editing.is_some() && {
                         self.cancel_edit();
@@ -924,16 +986,12 @@ impl App {
                 return Task::perform(
                     async {
                         let files = rfd::AsyncFileDialog::new()
-                            .set_title("Send photos or documents")
+                            .set_title("Send photos, videos or documents")
                             .pick_files()
                             .await?;
                         let paths: Vec<PathBuf> =
                             files.iter().map(|f| f.path().to_path_buf()).collect();
-                        tokio::task::spawn_blocking(move || {
-                            Box::new(paste::Staged::from_paths(paths, false))
-                        })
-                        .await
-                        .ok()
+                        paste::stage_paths(paths, false).await.map(Box::new)
                     },
                     move |staged| Message::done(Done::Staged { chat, staged }),
                 );
@@ -1128,6 +1186,7 @@ impl App {
         if self.open.as_ref().is_some_and(|c| c.chat == chat) {
             return Task::none();
         }
+        self.selection = None;
         let unread = self
             .chats
             .get(&chat)
@@ -1139,6 +1198,7 @@ impl App {
         let paused = self.compose_stop();
         self.stash_draft();
         self.info = None;
+        self.msg_info = None;
         self.scroll_y = 0.0;
         let mut conv = Conversation::new(chat.clone(), Vec::new(), false);
         conv.unread = (unread > 0).then_some(state::UnreadDivider {
@@ -1193,6 +1253,7 @@ impl App {
             expires_at: None,
             reply: None,
             edited: false,
+            forwarded: None,
             mentions: Vec::new(),
             reactions: Vec::new(),
         }
@@ -1302,11 +1363,12 @@ impl App {
             let chat = chat.clone();
             Task::perform(
                 async {
-                    tokio::task::spawn_blocking(|| paste::stage(paste::read_clipboard()))
-                        .await
-                        .ok()
-                        .flatten()
-                        .map(Box::new)
+                    let staged =
+                        tokio::task::spawn_blocking(|| paste::stage(paste::read_clipboard()))
+                            .await
+                            .ok()
+                            .flatten()?;
+                    Some(Box::new(paste::finish_videos(staged).await))
                 },
                 move |staged| Message::done(Done::Staged { chat, staged }),
             )
@@ -1389,10 +1451,9 @@ impl App {
     /// Queues or starts a download, at most [`crate::media::MAX_CONCURRENT_DOWNLOADS`]
     /// at a time.
     fn request_media(&mut self, id: &str, max_pixels: u64, urgent: bool) -> Task<Message> {
-        let Some(mref) = self
+        let Some((mref, origin)) = self
             .find_message(id)
-            .and_then(|m| m.content.media())
-            .cloned()
+            .and_then(|m| m.content.media().map(|r| (r.clone(), self.media_origin(m))))
         else {
             return Task::none();
         };
@@ -1421,7 +1482,7 @@ impl App {
         Task::perform(
             async move {
                 let r = async {
-                    let bytes = client.download(&mref).await.map_err(|e| e.to_string())?;
+                    let bytes = media_fetch::download(&client, &mref, Some(&origin)).await?;
                     if mref.kind == net::MediaKind::Sticker {
                         // WebP: decode the first frame off the UI thread.
                         let (w, h, px) = tokio::task::spawn_blocking(move || {
@@ -1501,6 +1562,7 @@ impl App {
         let Some(mref) = msg.content.media().cloned() else {
             return Task::none();
         };
+        let origin = self.media_origin(&msg);
         let declared = match &msg.content {
             Content::Voice { seconds, .. } => Some(*seconds),
             _ => None,
@@ -1535,7 +1597,7 @@ impl App {
         tasks.push(Task::perform(
             async move {
                 let r = async {
-                    let bytes = client.download(&mref).await.map_err(|e| e.to_string())?;
+                    let bytes = media_fetch::download(&client, &mref, Some(&origin)).await?;
                     tokio::task::spawn_blocking(move || {
                         audio::decode_ogg_opus_bounded(&bytes, declared)
                     })
@@ -1591,6 +1653,7 @@ impl App {
         let Some(m) = self.find_message(id).cloned() else {
             return Task::none();
         };
+        let origin = self.media_origin(&m);
         let Content::Document {
             file_name,
             media: Some(mref),
@@ -1610,7 +1673,7 @@ impl App {
         self.toast("Downloading document…");
         Task::perform(
             async move {
-                let bytes = client.download(&mref).await.map_err(|e| e.to_string())?;
+                let bytes = media_fetch::download(&client, &mref, Some(&origin)).await?;
                 tokio::task::spawn_blocking(move || {
                     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
                     let path = unique_path(&dir, &safe_name);
@@ -1679,6 +1742,12 @@ impl App {
         )
     }
 
+    /// The chat is muted now (timed mutes end on their own).
+    pub fn is_muted(&self, chat: &str) -> bool {
+        let now = now_secs();
+        self.chats.get(chat).is_some_and(|e| e.meta.is_muted(now))
+    }
+
     /// The open chat, if the user is reading its newest messages.
     pub fn reading_chat(&self) -> Option<&str> {
         let c = self.open.as_ref()?;
@@ -1700,11 +1769,19 @@ impl App {
             .get(&conv.chat)
             .is_some_and(|e| e.meta.unread > 0);
         let chat_id = conv.chat.clone();
-        self.chats.mark_read(&chat_id);
-        let clear = if had_badge {
-            store_task(&self.store, move |s| s.set_unread(&chat_id, 0))
+        // A chat marked unread by hand is "read" on the other devices too.
+        let sync = if self.chats.mark_read(&chat_id) {
+            self.sync_read_mark(chat_id.clone(), true, 1)
         } else {
             Task::none()
+        };
+        let clear = if had_badge {
+            Task::batch([
+                store_task(&self.store, move |s| s.set_unread(&chat_id, 0)),
+                sync,
+            ])
+        } else {
+            sync
         };
         let Some(conv) = &self.open else {
             return clear;
@@ -1902,6 +1979,11 @@ impl App {
                                 "34622222222@s.whatsapp.net".into(),
                             ))));
                         }
+                        ScreenshotTarget::Mute => {
+                            tasks.push(Task::done(Message::Ui(Ui::ChatAct(
+                                chat_actions::ChatAct::AskMute("34622222222@s.whatsapp.net".into()),
+                            ))));
+                        }
                         _ => {}
                     }
                 }
@@ -1910,12 +1992,17 @@ impl App {
                     Some((t, _)) if !t.list_only()
                 ) && self.open.is_none()
                 {
-                    let chat =
-                        if matches!(self.cfg.screenshot, Some((ScreenshotTarget::GroupInfo, _))) {
-                            "120363000000000001@g.us"
-                        } else {
-                            crate::mock::SHOWCASE_CHAT
-                        };
+                    let chat = if matches!(
+                        self.cfg.screenshot,
+                        Some((
+                            ScreenshotTarget::GroupInfo | ScreenshotTarget::GroupMessageInfo,
+                            _
+                        ))
+                    ) {
+                        "120363000000000001@g.us"
+                    } else {
+                        crate::mock::SHOWCASE_CHAT
+                    };
                     tasks.push(Task::done(Message::Ui(Ui::OpenChat(chat.into()))));
                 }
                 tasks.extend(self.nav_scene(nav::SceneStage::History));
@@ -1926,8 +2013,16 @@ impl App {
                 ids,
                 status,
                 participant,
+                timestamp,
             } => {
                 let chat = self.lid_map.normalize(&chat);
+                let timed = self.record_receipt_times(
+                    &chat,
+                    &ids,
+                    participant.as_deref(),
+                    status,
+                    timestamp,
+                );
                 if let Some(p) = participant
                     && net::is_group_jid(&chat)
                     && matches!(
@@ -1935,7 +2030,7 @@ impl App {
                         ReceiptStatus::Delivered | ReceiptStatus::Read | ReceiptStatus::Played
                     )
                 {
-                    return self.group_receipt(chat, ids, status, p);
+                    return Task::batch([timed, self.group_receipt(chat, ids, status, p)]);
                 }
                 self.chats.apply_receipt(&chat, &ids, status);
                 if let Some(c) = &mut self.open
@@ -1943,9 +2038,12 @@ impl App {
                 {
                     c.apply_receipt(&ids, status);
                 }
-                return store_task(&self.store, move |s| {
-                    s.apply_receipt(&chat, &ids, status).map(|_| ())
-                });
+                return Task::batch([
+                    timed,
+                    store_task(&self.store, move |s| {
+                        s.apply_receipt(&chat, &ids, status).map(|_| ())
+                    }),
+                ]);
             }
             Event::ContactName { jid, name, source } => {
                 let jid = self.lid_map.normalize(&jid);
@@ -1992,6 +2090,14 @@ impl App {
                 let chat = self.lid_map.normalize(&chat);
                 self.chats.mark_read(&chat);
                 return store_task(&self.store, move |s| s.set_unread(&chat, 0));
+            }
+            Event::ChatCleared { chat, keep_starred } => {
+                let chat = self.lid_map.normalize(&chat);
+                return self.apply_clear(chat, keep_starred);
+            }
+            Event::ChatDeleted { chat } => {
+                let chat = self.lid_map.normalize(&chat);
+                return self.apply_delete(chat);
             }
             Event::Call(signal) => return self.on_call_signal(signal),
             Event::LidMappings(pairs) => {
@@ -2316,8 +2422,7 @@ impl App {
                 .iter()
                 .filter(|m| fresh.contains(&m.id))
                 .filter(|m| {
-                    let muted = self.settings.muted
-                        || self.chats.get(&m.chat).is_some_and(|e| e.meta.muted);
+                    let muted = self.settings.muted || self.is_muted(&m.chat);
                     state::should_notify(m, open_chat.as_deref(), self.focused, muted)
                 })
                 .collect();
@@ -2421,6 +2526,7 @@ impl App {
                     ids: vec![id],
                     status,
                     participant: None,
+                    timestamp: 0,
                 });
             }
             Done::MediaSent { chat, id, result } => match result {
@@ -2439,6 +2545,7 @@ impl App {
                             ids: vec![id],
                             status: ReceiptStatus::Sent,
                             participant: None,
+                            timestamp: 0,
                         }),
                     ]);
                 }
@@ -2449,6 +2556,7 @@ impl App {
                         ids: vec![id],
                         status: ReceiptStatus::Failed,
                         participant: None,
+                        timestamp: 0,
                     });
                 }
             },
@@ -2488,6 +2596,7 @@ impl App {
             Done::Poster { chat, id, result } => return self.on_poster(chat, id, result),
             Done::ViewerImage { id, result } => self.on_viewer_image(id, result),
             Done::Info(d) => return self.on_info(*d),
+            Done::MsgInfo { chat, id, rows } => self.on_msg_info(chat, id, rows),
             Done::ViewerSaved(r) => match r {
                 Ok(Some(p)) => {
                     let name = p
@@ -2606,6 +2715,7 @@ impl App {
                 error,
             } => return self.on_member_failed(list, chat, undo, error),
             Done::Nav(d) => return self.on_nav_done(*d),
+            Done::ChatAct(d) => return self.on_chat_act_done(d),
             Done::Call(d) => return self.on_call_done(d),
             Done::Stored(Ok(())) | Done::Nothing => {}
             Done::Resync { attempt, result } => return self.on_resync(attempt, result),
@@ -2700,6 +2810,88 @@ impl App {
                 })));
                 v.push(ui(Ui::AttachCaption("Look at this sunset".into())));
             }
+            ScreenshotTarget::AttachVideo | ScreenshotTarget::AttachGif => {
+                // The real path of a picked file: staged, then probed (and
+                // for a GIF converted) by the helper.
+                let gif = target == ScreenshotTarget::AttachGif;
+                let dir =
+                    std::env::temp_dir().join(format!("ferrochat-shot-{}", std::process::id()));
+                let chat = c.chat.clone();
+                v.push(Task::perform(
+                    async move {
+                        let path = dir.join(if gif { "dancing.gif" } else { "trip.mp4" });
+                        let bytes = if gif {
+                            crate::mock::sample_gif()
+                        } else {
+                            include_bytes!("../../assets/mock-clip.mp4").to_vec()
+                        };
+                        tokio::fs::create_dir_all(&dir).await.ok()?;
+                        tokio::fs::write(&path, bytes).await.ok()?;
+                        let staged = paste::stage_paths(vec![path], false).await;
+                        let _ = tokio::fs::remove_dir_all(&dir).await;
+                        staged.map(Box::new)
+                    },
+                    move |staged| Message::done(Done::Staged { chat, staged }),
+                ));
+            }
+            ScreenshotTarget::Drop => v.push(ui(Ui::Drop(drop::DropMsg::Hovered))),
+            ScreenshotTarget::MessageInfo | ScreenshotTarget::GroupMessageInfo => {
+                // Receipts as they would arrive, then the panel.
+                let group = target == ScreenshotTarget::GroupMessageInfo;
+                let needle = if group {
+                    "Yo llevo las bebidas"
+                } else {
+                    "Llevo yo el café"
+                };
+                if let Some(m) = c.messages.iter().find(|m| {
+                    m.from_me && matches!(&m.content, Content::Text(t) if t.contains(needle))
+                }) {
+                    let (chat, id, ts) = (c.chat.clone(), m.id.clone(), m.timestamp);
+                    let receipt = |status, participant: Option<&str>, at: i64| {
+                        Task::done(Message::Net(net::Event::Receipt {
+                            chat: chat.clone(),
+                            ids: vec![id.clone()],
+                            status,
+                            participant: participant.map(str::to_string),
+                            timestamp: ts + at,
+                        }))
+                    };
+                    let steps = if group {
+                        vec![
+                            receipt(
+                                ReceiptStatus::Delivered,
+                                Some("34677777777@s.whatsapp.net"),
+                                4,
+                            ),
+                            receipt(ReceiptStatus::Read, Some("34677777777@s.whatsapp.net"), 95),
+                            receipt(
+                                ReceiptStatus::Delivered,
+                                Some("34688888888@s.whatsapp.net"),
+                                7,
+                            ),
+                            receipt(ReceiptStatus::Read, Some("34688888888@s.whatsapp.net"), 210),
+                            receipt(
+                                ReceiptStatus::Delivered,
+                                Some("34699999999@s.whatsapp.net"),
+                                40,
+                            ),
+                        ]
+                    } else {
+                        vec![
+                            receipt(ReceiptStatus::Delivered, None, 3),
+                            receipt(ReceiptStatus::Read, None, 75),
+                        ]
+                    };
+                    let open = ui(Ui::MessageInfo(id.clone()));
+                    v.push(
+                        Task::batch(steps).chain(
+                            Task::future(tokio::time::sleep(Duration::from_millis(500)))
+                                .discard()
+                                .chain(open),
+                        ),
+                    );
+                }
+            }
             ScreenshotTarget::Emoji => {
                 v.push(ui(Ui::Emoji("\u{1F602}")));
                 v.push(ui(Ui::Emoji("\u{2764}\u{FE0F}")));
@@ -2720,6 +2912,18 @@ impl App {
             }
             ScreenshotTarget::Call => v.extend(call::scene(&c.chat, false)),
             ScreenshotTarget::CallActive => v.extend(call::scene(&c.chat, true)),
+            ScreenshotTarget::Select | ScreenshotTarget::Forward => {
+                if let (Some(a), Some(b)) = (find("Mira esto"), find("Llevo yo el café")) {
+                    v.push(ui(Ui::Forward(forward::Fwd::Select(b))));
+                    v.push(ui(Ui::Forward(forward::Fwd::Toggle(a))));
+                }
+                if target == ScreenshotTarget::Forward {
+                    v.push(ui(Ui::Forward(forward::Fwd::Selected)));
+                    for chat in ["34622222222@s.whatsapp.net", "120363000000000001@g.us"] {
+                        v.push(ui(Ui::Forward(forward::Fwd::Target(chat.into()))));
+                    }
+                }
+            }
             ScreenshotTarget::Delete => {
                 if let Some(a) = find("Llevo yo el café") {
                     v.push(ui(Ui::AskDelete(a)));

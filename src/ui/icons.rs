@@ -143,12 +143,17 @@ pub enum Icon {
     MicOff,
     /// `video-off`
     VideoOff,
+    /// `forward`
+    Forward,
+    /// `info`
+    Info,
 }
 
 impl Icon {
     fn bytes(self) -> &'static [u8] {
         match self {
             Icon::Archive => include_bytes!("../../assets/icons/archive.svg"),
+            Icon::Info => include_bytes!("../../assets/icons/info.svg"),
             Icon::ZoomIn => include_bytes!("../../assets/icons/zoom-in.svg"),
             Icon::ZoomOut => include_bytes!("../../assets/icons/zoom-out.svg"),
             Icon::Ban => include_bytes!("../../assets/icons/ban.svg"),
@@ -215,6 +220,7 @@ impl Icon {
             Icon::PhoneOutgoing => include_bytes!("../../assets/icons/phone-outgoing.svg"),
             Icon::MicOff => include_bytes!("../../assets/icons/mic-off.svg"),
             Icon::VideoOff => include_bytes!("../../assets/icons/video-off.svg"),
+            Icon::Forward => include_bytes!("../../assets/icons/forward.svg"),
         }
     }
 

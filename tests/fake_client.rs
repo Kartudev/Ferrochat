@@ -166,6 +166,7 @@ async fn sending_text_walks_the_receipt_state_machine() {
         expires_at: None,
         reply: None,
         edited: false,
+        forwarded: None,
         mentions: Vec::new(),
         reactions: Vec::new(),
     };
@@ -315,6 +316,7 @@ async fn live_incoming_message_bumps_unread() {
         expires_at: None,
         reply: None,
         edited: false,
+        forwarded: None,
         mentions: Vec::new(),
         reactions: Vec::new(),
     });
@@ -342,6 +344,7 @@ async fn offline_drain_counts_unread_once() {
         expires_at: None,
         reply: None,
         edited: false,
+        forwarded: None,
         mentions: Vec::new(),
         reactions: Vec::new(),
     };

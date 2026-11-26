@@ -246,10 +246,11 @@ impl App {
 
     /// Chats with unread messages, muted chats excluded.
     pub(crate) fn unread_chats(&self) -> u32 {
+        let now = super::now_secs();
         self.chats
             .entries
             .iter()
-            .filter(|e| e.meta.unread > 0 && !e.meta.muted)
+            .filter(|e| e.meta.unread > 0 && !e.meta.is_muted(now))
             .count() as u32
     }
 

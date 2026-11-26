@@ -26,6 +26,12 @@ pub enum Error {
     /// Media decoding / playback failure.
     #[error("media error: {0}")]
     Media(String),
+    /// The CDN no longer has this media (404 / 410): ask for a re-upload.
+    #[error("media expired on the server")]
+    MediaExpired,
+    /// A re-upload was asked for and the phone no longer has the media.
+    #[error("media no longer available: {0}")]
+    MediaGone(String),
     /// The operation was cancelled (window closed, logout in progress, ...).
     #[error("cancelled")]
     Cancelled,
@@ -51,6 +57,10 @@ impl Error {
             }
             Error::Io(_) => "A local file could not be read or written.".into(),
             Error::Media(_) => "This media file could not be played or shown.".into(),
+            Error::MediaExpired => "This media expired on WhatsApp's servers.".into(),
+            Error::MediaGone(_) => {
+                "This media is no longer available. Ask the sender to send it again.".into()
+            }
             Error::Cancelled => "Cancelled.".into(),
         }
     }

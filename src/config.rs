@@ -25,6 +25,10 @@ pub enum ScreenshotTarget {
     ListSearch,
     /// Conversation with the "delete message" dialog.
     Delete,
+    /// Conversation in "Select messages" mode with two messages ticked.
+    Select,
+    /// The "Forward message to" dialog with two chats ticked.
+    Forward,
     /// Settings page (background / tray toggles).
     Settings,
     /// Chat list showing the archived chats.
@@ -33,6 +37,8 @@ pub enum ScreenshotTarget {
     Lists,
     /// Chat list with a chat's right-click menu open.
     ChatMenu,
+    /// The "Mute notifications" duration dialog.
+    Mute,
     /// The in-app video player.
     Video,
     /// Status tab: recent and viewed updates.
@@ -53,6 +59,16 @@ pub enum ScreenshotTarget {
     HeaderMenu,
     /// Conversation with the attachment preview of a pasted image.
     Paste,
+    /// Attachment preview of a picked MP4 (probed by the helper).
+    AttachVideo,
+    /// Attachment preview of a picked GIF (converted by the helper).
+    AttachGif,
+    /// Files dragged over the open conversation.
+    Drop,
+    /// "Message info" of one of our messages in a direct chat.
+    MessageInfo,
+    /// "Message info" of one of our messages in a group.
+    GroupMessageInfo,
     /// Conversation with the emoji drawer open.
     Emoji,
     /// The full-size image viewer.
@@ -81,6 +97,7 @@ impl ScreenshotTarget {
                 | Self::Archived
                 | Self::Lists
                 | Self::ChatMenu
+                | Self::Mute
                 | Self::StatusList
                 | Self::StatusViewer
                 | Self::Communities
@@ -120,10 +137,13 @@ impl ScreenshotTarget {
             "chat-search" => Some(Self::ChatSearch),
             "list-search" => Some(Self::ListSearch),
             "delete" => Some(Self::Delete),
+            "select" => Some(Self::Select),
+            "forward" => Some(Self::Forward),
             "settings" => Some(Self::Settings),
             "archived" => Some(Self::Archived),
             "lists" => Some(Self::Lists),
             "chat-menu" => Some(Self::ChatMenu),
+            "mute" => Some(Self::Mute),
             "video" => Some(Self::Video),
             "status" | "status-list" => Some(Self::StatusList),
             "status-viewer" => Some(Self::StatusViewer),
@@ -134,6 +154,11 @@ impl ScreenshotTarget {
             "starred" => Some(Self::Starred),
             "header-menu" | "menu-header" => Some(Self::HeaderMenu),
             "paste" | "attach" => Some(Self::Paste),
+            "attach-video" => Some(Self::AttachVideo),
+            "attach-gif" => Some(Self::AttachGif),
+            "drop" => Some(Self::Drop),
+            "message-info" => Some(Self::MessageInfo),
+            "group-message-info" => Some(Self::GroupMessageInfo),
             "emoji" | "emoji-picker" => Some(Self::Emoji),
             "viewer" | "image-viewer" => Some(Self::Viewer),
             "info" | "contact-info" => Some(Self::Info),

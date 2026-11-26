@@ -367,7 +367,7 @@ pub fn view<'a>(app: &'a App, info: &'a InfoPanel) -> El<'a> {
     body = body.push(section(app, starred.into()));
 
     // Mute.
-    let muted = app.chats.get(&info.chat).is_some_and(|e| e.meta.muted);
+    let muted = app.is_muted(&info.chat);
     let chat = info.chat.clone();
     body = body.push(section(
         app,

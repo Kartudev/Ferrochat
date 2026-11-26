@@ -63,6 +63,8 @@ pub struct VideoView {
     pub seeking: Option<f32>,
     /// Full screen.
     pub fullscreen: bool,
+    /// A GIF: starts over when it ends, like WhatsApp plays GIFs.
+    pub looping: bool,
     pub(crate) session: u32,
     pub(crate) rx: Shared,
     player: Option<Player>,
@@ -94,6 +96,7 @@ impl VideoView {
             muted: false,
             seeking: None,
             fullscreen: false,
+            looping: false,
             session,
             rx: Arc::new(Mutex::new(None)),
             player: None,
@@ -151,6 +154,13 @@ impl VideoView {
                 }
                 if duration_ms > 0 {
                     self.duration_ms = duration_ms;
+                }
+                if state == PlayState::Ended && self.looping && self.seeking.is_none() {
+                    self.send(Cmd::Seek(0));
+                    self.send(Cmd::Play);
+                    self.position_ms = 0;
+                    self.state = PlayState::Playing;
+                    return false;
                 }
                 self.state = state;
             }
@@ -221,7 +231,8 @@ impl App {
         let Some(m) = self.find_message(id).cloned() else {
             return Task::none();
         };
-        let Content::Video { media, .. } = m.content else {
+        let origin = self.media_origin(&m);
+        let Content::Video { media, gif, .. } = m.content else {
             return Task::none();
         };
         let Some(mref) = media else {
@@ -233,17 +244,22 @@ impl App {
             return Task::none();
         };
         self.video_session = self.video_session.wrapping_add(1);
-        self.video = Some(VideoView::new(id.to_string(), self.video_session));
+        let mut view = VideoView::new(id.to_string(), self.video_session);
+        view.looping = gif;
+        self.video = Some(view);
         self.viewer = None;
         self.popup = None;
         let dir = self.video_dir();
         let session = id.to_string();
-        Task::perform(fetch_video_file(client, mref, dir), move |result| {
-            Message::done(Done::VideoFile {
-                id: session,
-                result,
-            })
-        })
+        Task::perform(
+            fetch_video_file(client, mref, dir, Some(origin)),
+            move |result| {
+                Message::done(Done::VideoFile {
+                    id: session,
+                    result,
+                })
+            },
+        )
     }
 
     /// Videos in the open chat that came without an inline thumbnail get a
@@ -258,7 +274,7 @@ impl App {
         let Some(client) = self.client.clone() else {
             return Task::none();
         };
-        let Some((chat, id, mref)) = self.open.as_ref().and_then(|c| {
+        let Some((chat, id, mref, origin)) = self.open.as_ref().and_then(|c| {
             c.messages
                 .iter()
                 .rev()
@@ -274,7 +290,12 @@ impl App {
                         self.posters_tried.contains(&m.id),
                     ) =>
                     {
-                        Some((m.chat.clone(), m.id.clone(), r.clone()))
+                        Some((
+                            m.chat.clone(),
+                            m.id.clone(),
+                            r.clone(),
+                            self.media_origin(m),
+                        ))
                     }
                     _ => None,
                 })
@@ -293,7 +314,7 @@ impl App {
         let dir = scratch.clone().unwrap_or_else(|| self.video_dir());
         Task::perform(
             async move {
-                let path = fetch_video_file(client, mref, dir).await;
+                let path = fetch_video_file(client, mref, dir, Some(origin)).await;
                 let frame = match &path {
                     Ok(p) => {
                         crate::media::video::first_frame(p, std::time::Duration::from_secs(15))
@@ -510,13 +531,14 @@ pub(super) async fn fetch_video_file(
     client: crate::net::ClientHandle,
     mref: crate::net::MediaRef,
     dir: std::path::PathBuf,
+    origin: Option<super::media_fetch::MediaOrigin>,
 ) -> Result<std::path::PathBuf, String> {
     use crate::media::avatar;
     let ext = super::actions::video_extension(&mref.mimetype);
     let name = format!("{}.{ext}", avatar::name_hash(&mref.cache_key()));
     let path = dir.join(&name);
     if !path.is_file() {
-        let bytes = client.download(&mref).await.map_err(|e| e.to_string())?;
+        let bytes = super::media_fetch::download(&client, &mref, origin.as_ref()).await?;
         let (d, p) = (dir.clone(), path.clone());
         tokio::task::spawn_blocking(move || {
             crate::config::secure_dir(&d).map_err(|e| e.to_string())?;
@@ -587,6 +609,32 @@ mod tests {
         });
         assert!(!v.is_playing());
         assert!((v.progress() - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_gif_starts_over_instead_of_ending() {
+        let mut v = view();
+        v.looping = true;
+        v.apply(Event::Ready {
+            width: 2,
+            height: 2,
+            duration_ms: 1000,
+        });
+        v.apply(Event::Time {
+            position_ms: 1000,
+            duration_ms: 1000,
+            state: PlayState::Ended,
+        });
+        assert!(v.is_playing());
+        assert_eq!(v.position_ms, 0);
+        // A plain video stops at the end.
+        let mut v = view();
+        v.apply(Event::Time {
+            position_ms: 1000,
+            duration_ms: 1000,
+            state: PlayState::Ended,
+        });
+        assert_eq!(v.state, PlayState::Ended);
     }
 
     #[test]

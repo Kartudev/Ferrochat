@@ -5,7 +5,7 @@ edition = "2024"
 rust-version = "1.94"
 description = "Unofficial lightweight native WhatsApp desktop client written in Rust"
 license = "MIT"
-repository = "https://github.com/FerroApps/Ferrochat"
+repository = "https://github.com/Kartudev/Ferrochat-kartu"
 readme = "README.md"
 publish = false
 default-run = "ferrochat"
@@ -30,7 +30,7 @@ required-features = ["video"]
 # UI
 iced = { version = "0.14", features = ["tokio", "image", "advanced", "svg", "canvas"] }
 # Async runtime
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "process"] }
 futures = "0.3"
 # Channel type the whatsapp-rust VoIP facade takes for PCM endpoints (already in the tree through it).
 async-channel = "2"
@@ -58,7 +58,7 @@ serde_json = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 # Feature crates
 qrcode = { version = "0.14", default-features = false }
-image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
 notify-rust = "4"
 rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "async-std"] }
 rodio = { version = "0.21", default-features = false, features = ["playback"] }

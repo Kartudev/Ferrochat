@@ -27,8 +27,10 @@ pub use method::InstallMethod;
 pub use state::{Banner, CheckState, Phase, Updater};
 pub use version::Version;
 
-/// GitHub repository the releases come from.
-pub const REPO: &str = "FerroApps/Ferrochat";
+/// GitHub repository the releases come from (this fork's own releases).
+/// `Cargo.toml` `repository` and `install.sh` `REPO` must name the same one;
+/// `tests::release_repo_is_consistent` checks it.
+pub const REPO: &str = "Kartudev/Ferrochat-kartu";
 /// Crate / binary name (release asset prefix).
 pub const CRATE: &str = "ferrochat";
 /// User-facing name.
@@ -91,5 +93,21 @@ pub fn off_thread<T: Send + 'static>(
             Ok(_) => rx.await.ok(),
             Err(_) => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::REPO;
+
+    #[test]
+    fn release_repo_is_consistent() {
+        assert_eq!(
+            env!("CARGO_PKG_REPOSITORY"),
+            format!("https://github.com/{REPO}")
+        );
+        let script = include_str!("../../install.sh");
+        assert!(script.contains(&format!("REPO=\"{REPO}\"")));
+        assert!(script.contains(&format!("raw.githubusercontent.com/{REPO}/main/install.sh")));
     }
 }

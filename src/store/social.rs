@@ -197,7 +197,7 @@ impl Store {
         let conn = self.lock()?;
         let mut st = conn.prepare_cached(
             "SELECT m.chat_id, m.id, m.sender, m.sender_name, m.from_me, m.ts, m.content, m.thumb,
-                    m.status, m.expires_at, m.reply, m.edited, m.mentions, s.ts
+                    m.status, m.expires_at, m.reply, m.edited, m.mentions, m.forwarded, s.ts
              FROM starred s JOIN messages m ON m.chat_id = s.chat_id AND m.id = s.msg_id
              ORDER BY s.ts DESC, m.ts DESC LIMIT ?1",
         )?;
@@ -205,7 +205,7 @@ impl Store {
             .query_map(params![limit], |r| {
                 Ok(StarredMessage {
                     message: row_to_message(r)?,
-                    starred_at: r.get(13)?,
+                    starred_at: r.get(14)?,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -271,6 +271,7 @@ mod tests {
             expires_at: None,
             reply: None,
             edited: false,
+            forwarded: None,
             mentions: Vec::new(),
             reactions: Vec::new(),
         }

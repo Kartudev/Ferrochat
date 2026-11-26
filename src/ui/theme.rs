@@ -525,6 +525,55 @@ pub fn toggler(
     }
 }
 
+/// Radio buttons in dialogs (accent dot when picked).
+pub fn radio(
+    t: &FerroTheme,
+) -> impl Fn(&Theme, iced::widget::radio::Status) -> iced::widget::radio::Style + use<> {
+    let p = t.palette;
+    move |_, status| {
+        let picked = matches!(
+            status,
+            iced::widget::radio::Status::Active { is_selected: true }
+                | iced::widget::radio::Status::Hovered { is_selected: true }
+        );
+        iced::widget::radio::Style {
+            background: Background::Color(Color::TRANSPARENT),
+            dot_color: p.accent,
+            border_width: 2.0,
+            border_color: if picked { p.accent } else { p.text_secondary },
+            text_color: Some(p.text_primary),
+        }
+    }
+}
+
+/// Checkboxes in dialogs (accent box when ticked).
+pub fn checkbox(
+    t: &FerroTheme,
+) -> impl Fn(&Theme, iced::widget::checkbox::Status) -> iced::widget::checkbox::Style + use<> {
+    let p = t.palette;
+    move |_, status| {
+        let checked = match status {
+            iced::widget::checkbox::Status::Active { is_checked }
+            | iced::widget::checkbox::Status::Hovered { is_checked }
+            | iced::widget::checkbox::Status::Disabled { is_checked } => is_checked,
+        };
+        iced::widget::checkbox::Style {
+            background: Background::Color(if checked {
+                p.accent
+            } else {
+                Color::TRANSPARENT
+            }),
+            icon_color: p.accent_text,
+            border: iced::Border {
+                color: if checked { p.accent } else { p.text_secondary },
+                width: 2.0,
+                radius: 3.0.into(),
+            },
+            text_color: Some(p.text_primary),
+        }
+    }
+}
+
 /// Bubble-embedded button (play, document).
 pub fn flat_button(color: Color) -> impl Fn(&Theme, button::Status) -> button::Style + use<> {
     move |_, _| button::Style {

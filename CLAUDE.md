@@ -9,7 +9,7 @@ the `net::WaClient` trait. Unofficial: third-party clients can get accounts bann
 - `cargo build` / `cargo build --release` (use `CARGO_BUILD_JOBS=2` on shared hosts)
 - `cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test`
 - `cargo run -- --mock` (fake protocol + mock data, no network, no disk writes)
-- Screenshots: `ICED_BACKEND=tiny-skia xvfb-run -a -s "-screen 0 1280x800x24" ./target/debug/ferrochat --screenshot <login|chats|chat|reply|reactions|chat-search|list-search|delete|settings|paste|update-banner|update-settings|emoji|viewer|info|group-info> docs/screenshots/<name>.png`
+- Screenshots: `ICED_BACKEND=tiny-skia xvfb-run -a -s "-screen 0 1280x800x24" ./target/debug/ferrochat --screenshot <login|chats|chat|chat-menu|mute|reply|reactions|chat-search|list-search|delete|select|forward|settings|paste|attach-video|attach-gif|drop|message-info|group-message-info|update-banner|update-settings|emoji|viewer|info|group-info> docs/screenshots/<name>.png`
 - Tray test needs a session bus: `dbus-run-session -- cargo test` (the SNI test is skipped without one).
 - Regenerate fixtures: `cargo test --test gen_fixtures -- --ignored`
 
@@ -87,7 +87,10 @@ Wayland `app_id` / desktop entry id: `dev.ferro.ferrochat` (`packaging/`).
   B-frames (Main/High) fail to decode. Video frames are `image::Handle`s made in `update`, never
   in `view`; the video viewer replaces the whole view while open.
 - Chat flags / lists are optimistic: apply, persist, send, revert on failure
-  (`app/lists.rs`). Never send the `favorites` app-state action (it carries
+  (`app/lists.rs`, `app/chat_actions.rs`). Clear / delete chat are the exception:
+  sent first, applied when the phone has them. Mutes have an end
+  (`ChatMeta::mute_end`, seconds, -1 = always): read them through `App::is_muted` /
+  `ChatMeta::is_muted(now)`, never as a flag. Never send the `favorites` app-state action (it carries
   the whole list and would overwrite the phone's).
 - App-level tests: `app::test_support::Harness` (real `App` + fake client).
 - Updater (`src/update/`, `app/updates.rs`, `ui/update.rs`, architecture §11.5): only
@@ -110,6 +113,15 @@ Wayland `app_id` / desktop entry id: `dev.ferro.ferrochat` (`packaging/`).
   image. File managers also paste the paths as text: `strip_pasted_paths`
   removes them. Picked and pasted media both go through `AttachPreview`;
   its image handle is made in `update`.
+- Sending video / GIF (`app/paste.rs`): `.mp4`/`.m4v` (and `.gif`, converted first) are staged as documents, then
+  `paste::finish_videos` runs the helper (`media::video::probe`, muted; `gif_to_mp4` = `ferrochat-player
+  --gif-to-mp4`) as a child process, never on the blocking pool; a failure keeps the document. All file
+  sources (paperclip, paste, drop) go through `paste::stage_paths` / `finish_videos`. The GIF encoder lives
+  in `src/bin/ferrochat-player/gif.rs` (OpenH264 encoder + `mp4` writer): the main binary still links no codec.
+  `Content::Video::gif` is `#[serde(default)]` (old rows = plain video); GIFs loop in the viewer (`VideoView::looping`).
+- Drag and drop (`app/drop.rs`): one `FileDropped` per file, gathered for `drop::GATHER` and staged together;
+  the overlay follows `FileHovered` / `FilesHoveredLeft`. winit 0.30 has no drag and drop on native Wayland
+  (works on X11 / XWayland, Windows, macOS).
 - Never park an unbounded wait on tokio's blocking pool: iced drops its runtime on quit and that waits for
   every `spawn_blocking` task (KDE keeps notifications open, so a click watch there hung Quit). Notification
   click watches run on detached threads (`notify::show`); `tests/notify_quit.rs` guards it.
@@ -124,6 +136,12 @@ Wayland `app_id` / desktop entry id: `dev.ferro.ferrochat` (`packaging/`).
   (COLRv1 Noto draws blank/mono in swash). Picker data: `emojis` crate up to Unicode 17 (`app/emoji.rs`).
 - tiny-skia does not clip images: zoomed / covering pictures must sit UNDER opaque layers (image viewer
   bar) or use `ContentFit::Contain` (info drawer thumbnails).
+- Forwarding (`app/forward.rs`, `ui/forward.rs`): `WaClient::forward` rebuilds the body from the cached
+  `Content` (`convert::build_forward` + the library's `prepare_for_forward`), so media is relayed, not
+  re-uploaded; `Message::forwarded` is the forwarding score (`None` = not forwarded). Copies of one
+  forward get ids from `forward::ordered_ids` (same second, sorted by id) and are sent one after the
+  other. Selection mode covers each row with a click catcher; never send a forward for
+  `!Message::can_forward()`.
 - Mentions: show `ChatList::mention_label` / `render_mentions` (uses `Message::mentions`), never raw
   "@<LID>" text. Previews go through `App::preview`.
 - Info drawer queries (`WaClient::contact_info/group_info/common_groups/is_blocked`) run only when it
@@ -139,3 +157,10 @@ Wayland `app_id` / desktop entry id: `dev.ferro.ferrochat` (`packaging/`).
   which needs the stored offer (`net::call::CallBook`). State machine: `call::Calls` (pure,
   tested); app glue `app/call.rs`. Video calls are NOT implemented: the video button must keep
   saying so. `--mock`/tests open no audio device. Each call is logged once (`call-<id>` bubble).
+- Expired media (`app/media_fetch.rs`): every download goes through `media_fetch::download` with a `MediaOrigin`
+  (`App::media_origin`); on `Error::MediaExpired` (CDN 404/410) it calls `WaClient::reupload`, caches the new ref
+  (`Store::set_media_ref`) and parks it in `App::fresh_media`, applied to the open chat at the start of
+  `App::update` (`apply_fresh_media`). Forward refreshes media older than `forward::STALE_MEDIA_SECS` first.
+- Message info (`app/msg_info.rs`): receipt times live in `receipt_times` (schema 9), written by
+  `App::record_receipt_times` from every `Event::Receipt` (`timestamp` 0 = now); the open panel reloads after
+  the write (chained task). Only our messages; it shares the right slot with the info drawer (one at a time).

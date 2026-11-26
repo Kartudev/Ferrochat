@@ -257,22 +257,58 @@ pub fn spawn_with(
     ))
 }
 
+/// What the helper read from a file before its first picture.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Probe {
+    /// Frame width as decoded.
+    pub width: u32,
+    /// Frame height.
+    pub height: u32,
+    /// Duration in ms, 0 when the container does not say.
+    pub duration_ms: u64,
+    /// The first picture (RGBA, possibly scaled down by the helper).
+    pub frame: (u32, u32, Vec<u8>),
+}
+
 /// Decodes only the first picture of `file` with the helper at `helper`
-/// (a poster frame), then stops it. Gives up after `wait`.
-pub async fn first_frame_with(
+/// (a poster frame, or the probe of a video about to be sent), muted, then
+/// stops it. Gives up after `wait`.
+pub async fn probe_with(
     helper: &Path,
     file: &Path,
     wait: std::time::Duration,
-) -> Result<(u32, u32, Vec<u8>), Failure> {
+) -> Result<Probe, Failure> {
     let (player, mut rx) = spawn_with(helper, file)?;
+    // Probing must never make a sound.
+    player.send(Cmd::Mute(true));
     let deadline = tokio::time::Instant::now() + wait;
+    let mut size = (0, 0);
+    let mut duration_ms = 0;
     let out = loop {
         match tokio::time::timeout_at(deadline, rx.recv()).await {
+            Ok(Some(Event::Ready {
+                width,
+                height,
+                duration_ms: d,
+            })) => {
+                size = (width, height);
+                duration_ms = d;
+            }
             Ok(Some(Event::Frame {
                 width,
                 height,
                 rgba,
-            })) => break Ok((width, height, rgba)),
+            })) => {
+                if size == (0, 0) {
+                    size = (width, height);
+                }
+                break Ok(Probe {
+                    width: size.0,
+                    height: size.1,
+                    duration_ms,
+                    frame: (width, height, rgba),
+                });
+            }
             Ok(Some(Event::Failed(f))) => break Err(f),
             Ok(Some(_)) => {}
             Ok(None) => break Err(Failure::Broken("the helper ended without a picture".into())),
@@ -284,17 +320,78 @@ pub async fn first_frame_with(
     out
 }
 
+/// The first picture of `file` (a poster frame), see [`probe_with`].
+pub async fn first_frame_with(
+    helper: &Path,
+    file: &Path,
+    wait: std::time::Duration,
+) -> Result<(u32, u32, Vec<u8>), Failure> {
+    probe_with(helper, file, wait).await.map(|p| p.frame)
+}
+
+fn find_helper() -> Result<PathBuf, Failure> {
+    helper_path().ok_or_else(|| {
+        Failure::Unavailable(format!(
+            "the {HELPER_NAME} helper was not found next to Ferrochat"
+        ))
+    })
+}
+
 /// [`first_frame_with`] using the helper found by [`helper_path`].
 pub async fn first_frame(
     file: &Path,
     wait: std::time::Duration,
 ) -> Result<(u32, u32, Vec<u8>), Failure> {
-    let helper = helper_path().ok_or_else(|| {
-        Failure::Unavailable(format!(
-            "the {HELPER_NAME} helper was not found next to Ferrochat"
-        ))
-    })?;
-    first_frame_with(&helper, file, wait).await
+    first_frame_with(&find_helper()?, file, wait).await
+}
+
+/// [`probe_with`] using the helper found by [`helper_path`].
+pub async fn probe(file: &Path, wait: std::time::Duration) -> Result<Probe, Failure> {
+    probe_with(&find_helper()?, file, wait).await
+}
+
+/// Flag that turns the helper into a GIF → MP4 converter.
+pub const GIF_TO_MP4_FLAG: &str = "--gif-to-mp4";
+
+/// Converts an animated GIF into a silent H.264 MP4 the way WhatsApp sends
+/// GIFs, with the helper at `helper` (the main binary links no encoder).
+/// Gives up after `wait`.
+pub async fn gif_to_mp4_with(
+    helper: &Path,
+    gif: &Path,
+    mp4: &Path,
+    wait: std::time::Duration,
+) -> Result<(), Failure> {
+    let child = tokio::process::Command::new(helper)
+        .arg(GIF_TO_MP4_FLAG)
+        .arg(gif)
+        .arg(mp4)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|e| Failure::Unavailable(format!("cannot start the video helper: {e}")))?;
+    let out = tokio::time::timeout(wait, child.wait_with_output())
+        .await
+        .map_err(|_| Failure::Broken("the GIF took too long to convert".into()))?
+        .map_err(|e| Failure::Broken(e.to_string()))?;
+    if out.status.success() {
+        return Ok(());
+    }
+    let line = String::from_utf8_lossy(&out.stderr)
+        .lines()
+        .last()
+        .unwrap_or("the converter failed")
+        .chars()
+        .take(300)
+        .collect::<String>();
+    Err(Failure::Broken(line))
+}
+
+/// [`gif_to_mp4_with`] using the helper found by [`helper_path`].
+pub async fn gif_to_mp4(gif: &Path, mp4: &Path, wait: std::time::Duration) -> Result<(), Failure> {
+    gif_to_mp4_with(&find_helper()?, gif, mp4, wait).await
 }
 
 /// Starts the helper found by [`helper_path`].

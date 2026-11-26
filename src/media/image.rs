@@ -98,6 +98,11 @@ pub fn mime_for_path(path: &Path) -> &'static str {
         "jpg" | "jpeg" => "image/jpeg",
         "png" => "image/png",
         "webp" => "image/webp",
+        "gif" => "image/gif",
+        "mp4" | "m4v" => "video/mp4",
+        "mov" => "video/quicktime",
+        "webm" => "video/webm",
+        "mkv" => "video/x-matroska",
         "pdf" => "application/pdf",
         "txt" => "text/plain",
         "zip" => "application/zip",
@@ -119,7 +124,10 @@ pub fn outgoing_from_file(path: &Path, bytes: Vec<u8>, caption: Option<String>) 
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "file".into());
+    // GIFs are sent as videos (see `app::paste`); a still copy would lose
+    // the animation.
     if mimetype.starts_with("image/")
+        && mimetype != "image/gif"
         && let Ok((width, height, thumbnail)) = probe_and_thumbnail(&bytes)
     {
         // WhatsApp only renders JPEG photos reliably; others go as-is.
@@ -142,6 +150,17 @@ pub fn outgoing_from_file(path: &Path, bytes: Vec<u8>, caption: Option<String>) 
         mimetype: mimetype.into(),
         caption,
     }
+}
+
+/// The inline JPEG thumbnail (as sent with photos) of raw RGBA pixels:
+/// used for the first frame of a video.
+pub fn thumbnail_from_rgba(width: u32, height: u32, rgba: Vec<u8>) -> Result<Vec<u8>> {
+    let img = image::RgbaImage::from_raw(width, height, rgba)
+        .ok_or_else(|| Error::Media("frame size does not match its pixels".into()))?;
+    let thumb = image::DynamicImage::ImageRgba8(img)
+        .thumbnail(THUMB_SIDE, THUMB_SIDE)
+        .to_rgb8();
+    encode_jpeg(&thumb, 70)
 }
 
 /// Longest side of a pasted photo: WhatsApp's standard photo quality.
@@ -278,6 +297,24 @@ mod tests {
         // A broken "png" falls back to a document instead of failing.
         let bad = outgoing_from_file(Path::new("/x/b.png"), b"nope".to_vec(), None);
         assert_eq!(bad.kind, OutgoingKind::Document);
+        // A GIF that decodes is still not a photo (it is sent as a video).
+        let mut gif = Vec::new();
+        image::RgbaImage::from_pixel(4, 4, image::Rgba([1, 2, 3, 255]))
+            .write_to(&mut Cursor::new(&mut gif), image::ImageFormat::Gif)
+            .unwrap();
+        let g = outgoing_from_file(Path::new("/x/funny.gif"), gif, None);
+        assert_eq!(g.kind, OutgoingKind::Document);
+        assert_eq!(g.mimetype, "image/gif");
+        assert_eq!(mime_for_path(Path::new("/x/clip.MP4")), "video/mp4");
+    }
+
+    #[test]
+    fn video_frames_get_a_small_jpeg_thumbnail() {
+        let rgba = vec![200; 640 * 360 * 4];
+        let t = thumbnail_from_rgba(640, 360, rgba).unwrap();
+        let img = image::load_from_memory(&t).unwrap();
+        assert_eq!(img.width(), THUMB_SIDE);
+        assert!(thumbnail_from_rgba(10, 10, vec![0; 3]).is_err());
     }
 
     #[test]

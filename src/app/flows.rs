@@ -906,13 +906,19 @@ async fn the_header_opens_the_contact_info_drawer() {
         "the showcase chat has photos and a video"
     );
     assert!(!info.recent.is_empty());
-    // Mute is optimistic and synced.
+    // Mute asks for how long, then is optimistic and synced.
     h.ui(Ui::ToggleMute(SHOWCASE_CHAT.into())).await;
-    assert!(h.app.chats.get(SHOWCASE_CHAT).unwrap().meta.muted);
+    assert!(h.app.chat_dialog.is_some());
+    h.ui(Ui::ChatAct(super::chat_actions::ChatAct::ConfirmMute))
+        .await;
+    assert!(h.app.is_muted(SHOWCASE_CHAT));
     assert!(h.fake.log().iter().any(|s| matches!(
         s,
-        Sent::Mute { chat, muted: true } if chat == SHOWCASE_CHAT
+        Sent::Mute { chat, end } if chat == SHOWCASE_CHAT && *end > 0
     )));
+    // The switch unmutes at once.
+    h.ui(Ui::ToggleMute(SHOWCASE_CHAT.into())).await;
+    assert!(!h.app.is_muted(SHOWCASE_CHAT));
     // Block asks first.
     h.ui(Ui::AskBlock).await;
     assert!(h.app.info.as_ref().unwrap().confirm_block);
@@ -962,6 +968,7 @@ fn incoming(chat: &str, id: &str, ts: i64) -> crate::net::Message {
         expires_at: None,
         reply: None,
         edited: false,
+        forwarded: None,
         mentions: Vec::new(),
         reactions: Vec::new(),
     }

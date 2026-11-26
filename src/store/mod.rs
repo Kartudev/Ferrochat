@@ -12,7 +12,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::error::{Error, Result};
 use crate::net::types::{
-    ChatFlag, ChatMeta, Content, ListDef, ListKind, Message, NameSource, ReceiptStatus,
+    ChatFlag, ChatMeta, Content, ListDef, ListKind, MediaRef, Message, NameSource, ReceiptStatus,
 };
 
 const MIGRATIONS: &[&str] = &[
@@ -22,6 +22,9 @@ const MIGRATIONS: &[&str] = &[
     include_str!("migration_4.sql"),
     include_str!("migration_5.sql"),
     include_str!("migration_6.sql"),
+    include_str!("migration_7.sql"),
+    include_str!("migration_8.sql"),
+    include_str!("migration_9.sql"),
 ];
 
 mod social;
@@ -140,7 +143,7 @@ impl Store {
         let tx = conn.transaction()?;
         {
             let mut st = tx.prepare_cached(
-                "INSERT INTO chats (id, name, unread, last_ts, pinned, archived, muted)
+                "INSERT INTO chats (id, name, unread, last_ts, pinned, archived, mute_end)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
                  ON CONFLICT(id) DO UPDATE SET
                     name = COALESCE(excluded.name, chats.name),
@@ -148,11 +151,11 @@ impl Store {
                     last_ts = MAX(chats.last_ts, excluded.last_ts),
                     pinned = excluded.pinned,
                     archived = excluded.archived,
-                    muted = excluded.muted",
+                    mute_end = excluded.mute_end",
             )?;
             for c in chats {
                 st.execute(params![
-                    c.id, c.name, c.unread, c.last_ts, c.pinned, c.archived, c.muted
+                    c.id, c.name, c.unread, c.last_ts, c.pinned, c.archived, c.mute_end
                 ])?;
             }
         }
@@ -187,7 +190,7 @@ impl Store {
         let conn = self.lock()?;
         let mut st = conn.prepare_cached(
             "SELECT chat_id, id, sender, sender_name, from_me, ts, content, thumb, status, expires_at,
-                    reply, edited, mentions
+                    reply, edited, mentions, forwarded
              FROM messages
              WHERE chat_id = ?1 AND kind IN (SELECT value FROM json_each(?2))
              ORDER BY ts DESC, id DESC LIMIT ?3",
@@ -231,8 +234,8 @@ impl Store {
             let mut insert = tx.prepare_cached(
                 "INSERT INTO messages
                     (chat_id, id, sender, sender_name, from_me, ts, kind, content, thumb, status,
-                     expires_at, reply, edited, search, mentions)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                     expires_at, reply, edited, search, mentions, forwarded)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
             )?;
             let mut react = tx.prepare_cached(
                 "INSERT INTO reactions (chat_id, msg_id, reactor, emoji, ts)
@@ -280,6 +283,7 @@ impl Store {
                             m.edited,
                             search_text(&m.content),
                             encode_mentions(&m.mentions),
+                            m.forwarded,
                         ])?;
                         new_ids.push(m.id.clone());
                     }
@@ -314,6 +318,21 @@ impl Store {
 
     /// Replaces a message's content (e.g. after a media upload filled in
     /// the CDN reference) and/or status.
+    /// Points a cached message at re-uploaded media (new `directPath`).
+    /// `false` when the message is not cached or has no media.
+    pub fn set_media_ref(&self, chat: &str, id: &str, media: &MediaRef) -> Result<bool> {
+        let Some(m) = self.message(chat, id)? else {
+            return Ok(false);
+        };
+        let mut content = m.content;
+        let Some(slot) = content.media_mut() else {
+            return Ok(false);
+        };
+        *slot = media.clone();
+        self.update_message(chat, id, &content)?;
+        Ok(true)
+    }
+
     pub fn update_message(&self, chat: &str, id: &str, content: &Content) -> Result<()> {
         let (json, thumb) = encode_content(content)?;
         self.lock()?.execute(
@@ -371,7 +390,7 @@ impl Store {
         let (ts, id) = before.unwrap_or((i64::MAX, ""));
         let mut st = conn.prepare_cached(
             "SELECT chat_id, id, sender, sender_name, from_me, ts, content, thumb, status, expires_at,
-                    reply, edited, mentions
+                    reply, edited, mentions, forwarded
              FROM messages
              WHERE chat_id = ?1 AND (ts < ?2 OR (ts = ?2 AND id < ?3))
              ORDER BY ts DESC, id DESC LIMIT ?4",
@@ -390,7 +409,7 @@ impl Store {
         let conn = self.lock()?;
         let mut st = conn.prepare_cached(
             "SELECT chat_id, id, sender, sender_name, from_me, ts, content, thumb, status, expires_at,
-                    reply, edited, mentions
+                    reply, edited, mentions, forwarded
              FROM messages WHERE chat_id = ?1 AND id = ?2",
         )?;
         let mut m = st.query_row(params![chat, id], row_to_message).optional()?;
@@ -404,9 +423,9 @@ impl Store {
     pub fn chat_rows(&self) -> Result<Vec<ChatRow>> {
         let conn = self.lock()?;
         let mut st = conn.prepare_cached(
-            "SELECT c.id, c.name, c.unread, c.last_ts, c.pinned, c.archived, c.muted,
+            "SELECT c.id, c.name, c.unread, c.last_ts, c.pinned, c.archived, c.mute_end,
                     m.chat_id, m.id, m.sender, m.sender_name, m.from_me, m.ts, m.content,
-                    m.thumb, m.status, m.expires_at, m.reply, m.edited, m.mentions
+                    m.thumb, m.status, m.expires_at, m.reply, m.edited, m.mentions, m.forwarded
              FROM chats c
              LEFT JOIN messages m ON m.rowid = (
                 SELECT rowid FROM messages WHERE chat_id = c.id ORDER BY ts DESC, id DESC LIMIT 1
@@ -422,7 +441,7 @@ impl Store {
                     last_ts: r.get(3)?,
                     pinned: r.get(4)?,
                     archived: r.get(5)?,
-                    muted: r.get(6)?,
+                    mute_end: r.get(6)?,
                 };
                 let last = match r.get::<_, Option<String>>(7)? {
                     Some(_) => Some(row_to_message_at(r, 7)?),
@@ -481,17 +500,76 @@ impl Store {
 
     /// Persists an archive / pin / mute change (creating the chat row).
     pub fn set_chat_flag(&self, chat: &str, flag: ChatFlag) -> Result<()> {
-        let (col, on) = match flag {
-            ChatFlag::Archived(v) => ("archived", v),
-            ChatFlag::Pinned(v) => ("pinned", v),
-            ChatFlag::Muted(v) => ("muted", v),
+        let (col, value) = match flag {
+            ChatFlag::Archived(v) => ("archived", i64::from(v)),
+            ChatFlag::Pinned(v) => ("pinned", i64::from(v)),
+            ChatFlag::Muted(end) => ("mute_end", end),
         };
         // `col` is one of three literals above, never user input.
         let sql = format!(
             "INSERT INTO chats (id, {col}) VALUES (?1, ?2)
              ON CONFLICT(id) DO UPDATE SET {col} = excluded.{col}"
         );
-        self.lock()?.execute(&sql, params![chat, on])?;
+        self.lock()?.execute(&sql, params![chat, value])?;
+        Ok(())
+    }
+
+    /// "Clear chat": removes the chat's messages (keeping the starred ones
+    /// when `keep_starred`), their reactions and receipts. The chat stays.
+    pub fn clear_chat(&self, chat: &str, keep_starred: bool) -> Result<()> {
+        let keep = if keep_starred {
+            " AND id NOT IN (SELECT msg_id FROM starred WHERE chat_id = ?1)"
+        } else {
+            ""
+        };
+        let keep_ref = if keep_starred {
+            " AND msg_id NOT IN (SELECT msg_id FROM starred WHERE chat_id = ?1)"
+        } else {
+            ""
+        };
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        // Only the two literal filters above are spliced in.
+        tx.execute(
+            &format!("DELETE FROM reactions WHERE chat_id = ?1{keep_ref}"),
+            params![chat],
+        )?;
+        tx.execute(
+            &format!("DELETE FROM receipts WHERE chat_id = ?1{keep_ref}"),
+            params![chat],
+        )?;
+        tx.execute(
+            &format!("DELETE FROM receipt_times WHERE chat_id = ?1{keep_ref}"),
+            params![chat],
+        )?;
+        tx.execute(
+            &format!("DELETE FROM messages WHERE chat_id = ?1{keep}"),
+            params![chat],
+        )?;
+        if !keep_starred {
+            tx.execute("DELETE FROM starred WHERE chat_id = ?1", params![chat])?;
+        }
+        tx.execute("UPDATE chats SET unread = 0 WHERE id = ?1", params![chat])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// "Delete chat": the chat, its messages and everything hanging off
+    /// them. List memberships stay: they belong to the phone.
+    pub fn delete_chat(&self, chat: &str) -> Result<()> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        for sql in [
+            "DELETE FROM reactions WHERE chat_id = ?1",
+            "DELETE FROM receipts WHERE chat_id = ?1",
+            "DELETE FROM receipt_times WHERE chat_id = ?1",
+            "DELETE FROM messages WHERE chat_id = ?1",
+            "DELETE FROM starred WHERE chat_id = ?1",
+            "DELETE FROM chats WHERE id = ?1",
+        ] {
+            tx.execute(sql, params![chat])?;
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -615,7 +693,7 @@ impl Store {
     pub fn clear(&self) -> Result<()> {
         self.lock()?.execute_batch(
             "DELETE FROM messages; DELETE FROM chats; DELETE FROM contact_names; DELETE FROM kv;
-             DELETE FROM lid_map; DELETE FROM reactions; DELETE FROM receipts;
+             DELETE FROM lid_map; DELETE FROM reactions; DELETE FROM receipts; DELETE FROM receipt_times;
              DELETE FROM lists; DELETE FROM list_chats; DELETE FROM statuses; DELETE FROM starred;",
         )?;
         Ok(())
@@ -694,6 +772,7 @@ impl Store {
             "DELETE FROM messages WHERE chat_id = ?1 AND id = ?2",
             "DELETE FROM reactions WHERE chat_id = ?1 AND msg_id = ?2",
             "DELETE FROM receipts WHERE chat_id = ?1 AND msg_id = ?2",
+            "DELETE FROM receipt_times WHERE chat_id = ?1 AND msg_id = ?2",
         ] {
             tx.execute(sql, params![chat, id])?;
         }
@@ -754,7 +833,7 @@ impl Store {
     ) -> Result<Window> {
         let conn = self.lock()?;
         let cols = "chat_id, id, sender, sender_name, from_me, ts, content, thumb, status,
-                    expires_at, reply, edited, mentions";
+                    expires_at, reply, edited, mentions, forwarded";
         let mut older = conn
             .prepare_cached(&format!(
                 "SELECT {cols} FROM messages
@@ -796,7 +875,7 @@ impl Store {
         let mut rows = conn
             .prepare_cached(
                 "SELECT chat_id, id, sender, sender_name, from_me, ts, content, thumb, status,
-                        expires_at, reply, edited, mentions
+                        expires_at, reply, edited, mentions, forwarded
                  FROM messages
                  WHERE chat_id = ?1 AND (ts > ?2 OR (ts = ?2 AND id > ?3))
                  ORDER BY ts ASC, id ASC LIMIT ?4",
@@ -871,6 +950,85 @@ impl Store {
         Ok(changed)
     }
 
+    /// Records when a delivered / read / played receipt of our messages
+    /// arrived (`participant` is `""` in direct chats). The first time of
+    /// each step wins; other people's messages are skipped.
+    pub fn record_receipt_times(
+        &self,
+        chat: &str,
+        ids: &[String],
+        participant: &str,
+        status: ReceiptStatus,
+        ts: i64,
+    ) -> Result<()> {
+        if !matches!(
+            status,
+            ReceiptStatus::Delivered | ReceiptStatus::Read | ReceiptStatus::Played
+        ) {
+            return Ok(());
+        }
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        {
+            let mut ins = tx.prepare_cached(
+                "INSERT OR IGNORE INTO receipt_times (chat_id, msg_id, participant, status, ts)
+                 SELECT ?1, ?2, ?3, ?4, ?5
+                 WHERE EXISTS (SELECT 1 FROM messages
+                               WHERE chat_id = ?1 AND id = ?2 AND from_me = 1)",
+            )?;
+            for id in ids {
+                ins.execute(params![chat, id, participant, status.to_i64(), ts])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Everything known about who received / read one of our messages:
+    /// one row per participant (`""` in direct chats) with its furthest
+    /// status and the time of each step, when it was seen arriving.
+    pub fn receipt_details(&self, chat: &str, id: &str) -> Result<Vec<ReceiptDetail>> {
+        let conn = self.lock()?;
+        let mut out: std::collections::BTreeMap<String, ReceiptDetail> = Default::default();
+        let mut times = conn.prepare_cached(
+            "SELECT participant, status, ts FROM receipt_times WHERE chat_id = ?1 AND msg_id = ?2",
+        )?;
+        let rows = times.query_map(params![chat, id], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                ReceiptStatus::from_i64(r.get(1)?),
+                r.get::<_, i64>(2)?,
+            ))
+        })?;
+        for row in rows {
+            let (p, status, ts) = row?;
+            let d = out
+                .entry(p.clone())
+                .or_insert_with(|| ReceiptDetail::new(p));
+            d.status = d.status.advance(status);
+            match status {
+                ReceiptStatus::Delivered => d.delivered = Some(ts),
+                ReceiptStatus::Read => d.read = Some(ts),
+                ReceiptStatus::Played => d.played = Some(ts),
+                _ => {}
+            }
+        }
+        let mut st = conn.prepare_cached(
+            "SELECT participant, status FROM receipts WHERE chat_id = ?1 AND msg_id = ?2",
+        )?;
+        let rows = st.query_map(params![chat, id], |r| {
+            Ok((r.get::<_, String>(0)?, ReceiptStatus::from_i64(r.get(1)?)))
+        })?;
+        for row in rows {
+            let (p, status) = row?;
+            let d = out
+                .entry(p.clone())
+                .or_insert_with(|| ReceiptDetail::new(p));
+            d.status = d.status.advance(status);
+        }
+        Ok(out.into_values().collect())
+    }
+
     /// Per-participant receipts of a message: `(participant, status)`.
     pub fn receipts_of(&self, chat: &str, id: &str) -> Result<Vec<(String, ReceiptStatus)>> {
         let conn = self.lock()?;
@@ -884,6 +1042,31 @@ impl Store {
             })?
             .collect::<std::result::Result<_, _>>()?;
         Ok(rows)
+    }
+}
+
+/// One participant's receipts of one of our messages ([`Store::receipt_details`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReceiptDetail {
+    /// Bare JID, `""` in direct chats.
+    pub participant: String,
+    /// Furthest step seen.
+    pub status: ReceiptStatus,
+    /// Unix seconds of each step, when its receipt was seen arriving.
+    pub delivered: Option<i64>,
+    pub read: Option<i64>,
+    pub played: Option<i64>,
+}
+
+impl ReceiptDetail {
+    fn new(participant: String) -> Self {
+        Self {
+            participant,
+            status: ReceiptStatus::Sent,
+            delivered: None,
+            read: None,
+            played: None,
+        }
     }
 }
 
@@ -1053,6 +1236,7 @@ fn row_to_message_at(r: &rusqlite::Row<'_>, o: usize) -> rusqlite::Result<Messag
             .get::<_, Option<String>>(o + 12)?
             .map(|j| decode_mentions(&j))
             .unwrap_or_default(),
+        forwarded: r.get(o + 13)?,
     })
 }
 
@@ -1091,6 +1275,7 @@ mod tests {
             expires_at: None,
             reply: None,
             edited: false,
+            forwarded: None,
             mentions: Vec::new(),
             reactions: Vec::new(),
         }
@@ -1112,6 +1297,44 @@ mod tests {
     }
 
     #[test]
+    fn a_reuploaded_media_path_is_kept() {
+        let s = Store::open_in_memory().unwrap();
+        let mref = MediaRef {
+            direct_path: "/old".into(),
+            media_key: vec![1; 32],
+            file_sha256: vec![2; 32],
+            file_enc_sha256: vec![3; 32],
+            file_length: 10,
+            kind: crate::net::MediaKind::Image,
+            mimetype: "image/jpeg".into(),
+        };
+        let mut m = msg("c", "p", 10, false, "");
+        m.content = Content::Image {
+            caption: Some("hi".into()),
+            width: 4,
+            height: 3,
+            thumbnail: Some(vec![7]),
+            media: Some(mref.clone()),
+        };
+        s.insert_messages(&[m]).unwrap();
+        let fresh = MediaRef {
+            direct_path: "/new".into(),
+            ..mref
+        };
+        assert!(s.set_media_ref("c", "p", &fresh).unwrap());
+        let got = s.message("c", "p").unwrap().unwrap();
+        assert_eq!(got.content.media(), Some(&fresh));
+        assert!(matches!(
+            got.content,
+            Content::Image { thumbnail: Some(ref t), caption: Some(_), .. } if t == &[7]
+        ));
+        assert!(!s.set_media_ref("c", "missing", &fresh).unwrap());
+        s.insert_messages(&[msg("c", "t", 11, false, "text")])
+            .unwrap();
+        assert!(!s.set_media_ref("c", "t", &fresh).unwrap());
+    }
+
+    #[test]
     fn a_poster_frame_is_kept_as_the_video_thumbnail() {
         let s = Store::open_in_memory().unwrap();
         let mut m = msg("c", "v", 10, false, "");
@@ -1122,6 +1345,7 @@ mod tests {
             height: 180,
             thumbnail: None,
             media: None,
+            gif: true,
         };
         s.insert_messages(&[m]).unwrap();
         s.set_thumb("c", "v", &[1, 2, 3]).unwrap();
@@ -1130,7 +1354,7 @@ mod tests {
         let got = s.message("c", "v").unwrap().unwrap();
         assert!(matches!(
             got.content,
-            Content::Video { thumbnail: Some(ref t), .. } if t == &[1, 2, 3]
+            Content::Video { thumbnail: Some(ref t), gif: true, .. } if t == &[1, 2, 3]
         ));
     }
 
@@ -1449,12 +1673,114 @@ mod tests {
         let s = Store::open_in_memory().unwrap();
         s.set_chat_flag("a", ChatFlag::Archived(true)).unwrap();
         s.set_chat_flag("a", ChatFlag::Pinned(true)).unwrap();
-        s.set_chat_flag("a", ChatFlag::Muted(true)).unwrap();
+        s.set_chat_flag("a", ChatFlag::Muted(1_900_000_000))
+            .unwrap();
         let row = s.chat_rows().unwrap().remove(0);
-        assert!(row.meta.archived && row.meta.pinned && row.meta.muted);
+        assert!(row.meta.archived && row.meta.pinned);
+        assert_eq!(row.meta.mute_end, 1_900_000_000);
         s.set_chat_flag("a", ChatFlag::Archived(false)).unwrap();
         assert!(!s.chat_rows().unwrap()[0].meta.archived);
         assert!(s.chat_rows().unwrap()[0].meta.pinned);
+    }
+
+    #[test]
+    fn forwarded_mark_round_trips_and_old_rows_read_as_not_forwarded() {
+        let conn = Connection::open_in_memory().unwrap();
+        for (i, sql) in MIGRATIONS.iter().take(7).enumerate() {
+            conn.execute_batch(sql).unwrap();
+            conn.pragma_update(None, "user_version", i as i64 + 1)
+                .unwrap();
+        }
+        conn.execute_batch(
+            "INSERT INTO messages (chat_id, id, sender, from_me, ts, kind, content, status)
+             VALUES ('c', 'old', 'c', 0, 1, 'text', '{\"Text\":\"hi\"}', 3);",
+        )
+        .unwrap();
+        let s = Store::init(conn).unwrap();
+        assert_eq!(s.schema_version().unwrap(), MIGRATIONS.len() as i64);
+        let mut m = msg("c", "new", 2, false, "fwd");
+        m.forwarded = Some(4);
+        s.insert_messages(&[m]).unwrap();
+        let page = s.load_messages("c", None, 10).unwrap();
+        assert_eq!(page.len(), 2);
+        assert_eq!(page[0].forwarded, None);
+        assert_eq!(page[1].forwarded, Some(4));
+        assert_eq!(s.message("c", "new").unwrap().unwrap().forwarded, Some(4));
+        let row = s.chat_rows().unwrap().remove(0);
+        assert_eq!(row.last.unwrap().forwarded, Some(4));
+    }
+
+    #[test]
+    fn migration_7_keeps_old_mutes_as_always() {
+        let conn = Connection::open_in_memory().unwrap();
+        for (i, sql) in MIGRATIONS.iter().take(6).enumerate() {
+            conn.execute_batch(sql).unwrap();
+            conn.pragma_update(None, "user_version", i as i64 + 1)
+                .unwrap();
+        }
+        conn.execute_batch(
+            "INSERT INTO chats (id, muted) VALUES ('m', 1);
+             INSERT INTO chats (id, muted) VALUES ('u', 0);",
+        )
+        .unwrap();
+        let s = Store::init(conn).unwrap();
+        let rows = s.chat_rows().unwrap();
+        let end = |id: &str| rows.iter().find(|r| r.meta.id == id).unwrap().meta.mute_end;
+        assert_eq!(end("m"), crate::net::MUTE_FOREVER);
+        assert_eq!(end("u"), crate::net::MUTE_OFF);
+    }
+
+    #[test]
+    fn clear_chat_keeps_the_chat_and_optionally_the_starred() {
+        let s = Store::open_in_memory().unwrap();
+        s.insert_messages(&[
+            msg("a", "1", 10, false, "one"),
+            msg("a", "2", 20, true, "two"),
+            msg("b", "3", 30, false, "other chat"),
+        ])
+        .unwrap();
+        s.set_unread("a", 2).unwrap();
+        s.set_star("a", "1", true, 50).unwrap();
+        s.apply_reaction("a", "2", "x@s.whatsapp.net", "👍", 40)
+            .unwrap();
+        s.clear_chat("a", true).unwrap();
+        let left: Vec<_> = s
+            .load_messages("a", None, 50)
+            .unwrap()
+            .into_iter()
+            .map(|m| m.id)
+            .collect();
+        assert_eq!(left, vec!["1".to_string()], "the starred one stays");
+        assert!(s.is_starred("a", "1").unwrap());
+        let a = s.chat_rows().unwrap();
+        let a = a.iter().find(|r| r.meta.id == "a").unwrap();
+        assert_eq!(a.meta.unread, 0);
+        s.clear_chat("a", false).unwrap();
+        assert!(s.load_messages("a", None, 50).unwrap().is_empty());
+        assert!(!s.is_starred("a", "1").unwrap());
+        assert!(s.chat_rows().unwrap().iter().any(|r| r.meta.id == "a"));
+        assert_eq!(s.load_messages("b", None, 50).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn delete_chat_drops_the_row_and_its_messages() {
+        let s = Store::open_in_memory().unwrap();
+        s.insert_messages(&[
+            msg("a", "1", 10, false, "one"),
+            msg("b", "2", 20, false, "two"),
+        ])
+        .unwrap();
+        s.set_star("a", "1", true, 50).unwrap();
+        s.delete_chat("a").unwrap();
+        assert!(s.load_messages("a", None, 50).unwrap().is_empty());
+        assert!(!s.is_starred("a", "1").unwrap());
+        let ids: Vec<_> = s
+            .chat_rows()
+            .unwrap()
+            .into_iter()
+            .map(|r| r.meta.id)
+            .collect();
+        assert_eq!(ids, vec!["b".to_string()]);
     }
 
     #[test]
@@ -1511,6 +1837,7 @@ mod tests {
             expires_at: None,
             reply: None,
             edited: false,
+            forwarded: None,
             mentions: Vec::new(),
             reactions: Vec::new(),
         };

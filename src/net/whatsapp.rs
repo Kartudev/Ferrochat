@@ -30,8 +30,9 @@ use super::call::{self, CallAudio, CallBook};
 use super::convert::{self, Envelope, Uploaded};
 use super::social::{CommunityInfo, PhoneLookup};
 use super::types::{
-    ChatState, CollectionResync, ContactInfo, Content, GroupInfo, ListDef, MediaKind, MediaRef,
-    MsgKey, NameSource, Origin, OutgoingKind, OutgoingMedia, Quote, ResyncReport,
+    ChatState, CollectionResync, ContactInfo, Content, GroupInfo, ListDef, MUTE_OFF, MediaKind,
+    MediaRef, Message, MsgKey, NameSource, Origin, OutgoingKind, OutgoingMedia, Quote,
+    ResyncReport,
 };
 use super::{Connection, Event, WaClient};
 use crate::auth::secrets::{SecretStore, get_signal_store_key, signal_store_key};
@@ -155,6 +156,7 @@ impl WaClient for RealClient {
             let mt = match media.kind {
                 OutgoingKind::Image { .. } => MediaType::Image,
                 OutgoingKind::Document => MediaType::Document,
+                OutgoingKind::Video { .. } => MediaType::Video,
                 OutgoingKind::Voice { .. } => MediaType::Audio,
             };
             let up = self
@@ -181,6 +183,24 @@ impl WaClient for RealClient {
         })
     }
 
+    fn forward<'a>(
+        &'a self,
+        chat: &'a str,
+        id: &'a str,
+        source: &'a Message,
+    ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            let jid = parse_jid(chat)?;
+            let msg = convert::build_forward(&source.content, source.forwarded)
+                .ok_or_else(|| Error::Protocol("this message can't be forwarded".into()))?;
+            self.client
+                .send_message_with_options(jid, msg, SendOptions::default().with_message_id(id))
+                .await
+                .map_err(|e| Error::Net(e.to_string()))?;
+            Ok(())
+        })
+    }
+
     fn download<'a>(&'a self, media: &'a MediaRef) -> BoxFuture<'a, Result<Vec<u8>>> {
         Box::pin(async move {
             crate::media::check_download_size(media.file_length)?;
@@ -196,9 +216,59 @@ impl WaClient for RealClient {
                 .client
                 .download_from_params(&params)
                 .await
-                .map_err(|e| Error::Net(format!("download failed: {e}")))?;
+                .map_err(|e| {
+                    use whatsapp_rust::ErrorChainExt as _;
+                    // 404 / 410 after the library refreshed its media
+                    // connection: the blob is gone from the CDN.
+                    let chain: &(dyn std::error::Error + Send + Sync + 'static) = e.as_ref();
+                    if matches!(chain.http_status(), Some(404 | 410)) {
+                        Error::MediaExpired
+                    } else {
+                        Error::Net(format!("download failed: {e}"))
+                    }
+                })?;
             crate::media::check_download_size(bytes.len() as u64)?;
             Ok(bytes)
+        })
+    }
+
+    fn reupload<'a>(
+        &'a self,
+        key: &'a MsgKey,
+        media: &'a MediaRef,
+    ) -> BoxFuture<'a, Result<MediaRef>> {
+        Box::pin(async move {
+            use whatsapp_rust::{MediaRetryResult, MediaReuploadRequest};
+            let chat = parse_jid(&key.chat)?;
+            // Groups name the author; a direct chat is the author itself.
+            let participant = if super::is_group_jid(&key.chat) && !key.from_me {
+                Some(parse_jid(&key.sender)?)
+            } else {
+                None
+            };
+            let result = self
+                .client
+                .media_reupload()
+                .request(&MediaReuploadRequest {
+                    msg_id: &key.id,
+                    chat_jid: &chat,
+                    media_key: &media.media_key,
+                    is_from_me: key.from_me,
+                    participant: participant.as_ref(),
+                })
+                .await
+                .map_err(|e| Error::Net(format!("media re-upload failed: {e}")))?;
+            match result {
+                MediaRetryResult::Success { direct_path } => Ok(MediaRef {
+                    direct_path,
+                    ..media.clone()
+                }),
+                MediaRetryResult::NotFound => Err(Error::MediaGone("not found".into())),
+                MediaRetryResult::DecryptionError => {
+                    Err(Error::MediaGone("decryption error".into()))
+                }
+                MediaRetryResult::GeneralError => Err(Error::MediaGone("general error".into())),
+            }
         })
     }
 
@@ -845,16 +915,71 @@ impl WaClient for RealClient {
         })
     }
 
-    fn set_muted<'a>(&'a self, chat: &'a str, muted: bool) -> BoxFuture<'a, Result<()>> {
+    fn set_mute<'a>(&'a self, chat: &'a str, end: i64) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
             let jid = parse_jid(chat)?;
             let actions = self.client.chat_actions();
-            if muted {
+            if end == MUTE_OFF {
+                actions.unmute_chat(&jid).await
+            } else if end < 0 {
                 actions.mute_chat(&jid).await
             } else {
-                actions.unmute_chat(&jid).await
+                // The protocol counts the mute end in milliseconds.
+                actions
+                    .mute_chat_until(&jid, end.saturating_mul(1000))
+                    .await
             }
             .map_err(|e| Error::Net(e.to_string()))
+        })
+    }
+
+    fn mark_chat_read<'a>(
+        &'a self,
+        chat: &'a str,
+        read: bool,
+        last: Option<&'a (MsgKey, i64)>,
+    ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            let jid = parse_jid(chat)?;
+            let range = message_range(&jid, last)?;
+            self.client
+                .chat_actions()
+                .mark_chat_as_read(&jid, read, range)
+                .await
+                .map_err(|e| Error::Net(e.to_string()))
+        })
+    }
+
+    fn clear_chat<'a>(
+        &'a self,
+        chat: &'a str,
+        keep_starred: bool,
+        last: Option<&'a (MsgKey, i64)>,
+    ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            let jid = parse_jid(chat)?;
+            let range = message_range(&jid, last)?;
+            self.client
+                .chat_actions()
+                .clear_chat(&jid, !keep_starred, false, range)
+                .await
+                .map_err(|e| Error::Net(e.to_string()))
+        })
+    }
+
+    fn delete_chat<'a>(
+        &'a self,
+        chat: &'a str,
+        last: Option<&'a (MsgKey, i64)>,
+    ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            let jid = parse_jid(chat)?;
+            let range = message_range(&jid, last)?;
+            self.client
+                .chat_actions()
+                .delete_chat(&jid, false, range)
+                .await
+                .map_err(|e| Error::Net(e.to_string()))
         })
     }
 
@@ -1148,6 +1273,26 @@ fn is_terminal(ev: &WaEvent) -> bool {
     }
 }
 
+/// The `messageRange` of a chat action: the newest message and its time,
+/// so the phone applies the action only to what this device had seen.
+fn message_range(
+    chat: &Jid,
+    last: Option<&(MsgKey, i64)>,
+) -> Result<Option<whatsapp_rust::SyncActionMessageRange>> {
+    let Some((key, ts)) = last else {
+        return Ok(None);
+    };
+    let participant = (chat.is_group() && !key.from_me)
+        .then(|| parse_jid(&key.sender))
+        .transpose()?;
+    let k = whatsapp_rust::message_key(key.id.clone(), chat, key.from_me, participant.as_ref());
+    Ok(Some(whatsapp_rust::message_range(
+        *ts,
+        None,
+        vec![(k, *ts)],
+    )))
+}
+
 fn now_secs() -> i64 {
     chrono::Utc::now().timestamp()
 }
@@ -1363,6 +1508,7 @@ fn translate(ev: &WaEvent, client: &Client, attempt: &mut u32) -> Vec<Event> {
                         .source
                         .is_group
                         .then(|| convert::bare_jid(&r.source.sender.to_string())),
+                    timestamp: r.timestamp.timestamp(),
                 }],
                 None => vec![],
             }
@@ -1395,7 +1541,14 @@ fn translate(ev: &WaEvent, client: &Client, attempt: &mut u32) -> Vec<Event> {
         }],
         WaEvent::MuteUpdate(m) => vec![Event::ChatFlag {
             chat: convert::bare_jid(&m.jid.to_string()),
-            flag: convert::mute_flag(&m.action, now_secs()),
+            flag: convert::mute_flag(&m.action),
+        }],
+        WaEvent::ClearChatUpdate(c) => vec![Event::ChatCleared {
+            chat: convert::bare_jid(&c.jid.to_string()),
+            keep_starred: !c.delete_starred,
+        }],
+        WaEvent::DeleteChatUpdate(d) => vec![Event::ChatDeleted {
+            chat: convert::bare_jid(&d.jid.to_string()),
         }],
         WaEvent::LabelEditUpdate(l) => vec![convert::list_edit_event(&l.label_id, &l.action)],
         WaEvent::LabelAssociationUpdate(l) => vec![Event::ListChat {

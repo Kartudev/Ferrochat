@@ -185,10 +185,33 @@ pub fn strip_pasted_paths(draft: &str, paths: &[PathBuf]) -> Option<String> {
     (text != draft).then(|| text.trim().to_string())
 }
 
+/// A picked file that should go as a video once the helper has read it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingVideo {
+    /// Position in [`Staged::items`] (staged as a document until then).
+    pub index: usize,
+    pub path: PathBuf,
+    /// A GIF: converted to a silent MP4 first.
+    pub gif: bool,
+}
+
+/// Whether a file goes as a video: `Some(false)` for MP4, `Some(true)` for
+/// a GIF (converted), `None` for anything else (other containers stay
+/// documents: the helper only reads MP4 and WhatsApp only plays MP4).
+pub fn video_kind(path: &Path) -> Option<bool> {
+    match media_image::mime_for_path(path) {
+        "video/mp4" => Some(false),
+        "image/gif" => Some(true),
+        _ => None,
+    }
+}
+
 /// Media ready for the preview, built off the UI thread.
 #[derive(Debug, Clone, Default)]
 pub struct Staged {
     pub items: Vec<OutgoingMedia>,
+    /// Items still to be probed as videos ([`finish_videos`]).
+    pub videos: Vec<PendingVideo>,
     /// Preview pixels of the first item when it is a photo.
     pub preview: Option<(u32, u32, Vec<u8>)>,
     /// Paths to strip from the draft (the text input pasted them as text).
@@ -225,9 +248,19 @@ impl Staged {
             paths.truncate(MAX_PASTED_FILES);
         }
         let mut items = Vec::new();
+        let mut videos = Vec::new();
         for p in &paths {
             match prepare_path(p) {
-                Ok(m) => items.push(m),
+                Ok(m) => {
+                    if let Some(gif) = video_kind(p) {
+                        videos.push(PendingVideo {
+                            index: items.len(),
+                            path: p.clone(),
+                            gif,
+                        });
+                    }
+                    items.push(m);
+                }
                 Err(e) => {
                     let name = p
                         .file_name()
@@ -237,7 +270,9 @@ impl Staged {
                 }
             }
         }
-        Self::finish(items, if pasted { paths } else { Vec::new() }, problems)
+        let mut s = Self::finish(items, if pasted { paths } else { Vec::new() }, problems);
+        s.videos = videos;
+        s
     }
 
     /// Prepares a copied image.
@@ -260,15 +295,128 @@ impl Staged {
         let preview = items.first().and_then(media_image::preview_rgba);
         Self {
             items,
+            videos: Vec::new(),
             preview,
             pasted_paths,
             problems,
         }
     }
+
+    /// Applies what the helper read from a pending video: the item becomes
+    /// a video (GIFs take the converted MP4's bytes), or stays a document
+    /// with a note when the file could not be read.
+    pub fn apply_probe(
+        &mut self,
+        pending: &PendingVideo,
+        result: Result<(crate::media::video::Probe, Option<Vec<u8>>), String>,
+    ) {
+        let Some(item) = self.items.get_mut(pending.index) else {
+            return;
+        };
+        let probed = result.and_then(|(probe, converted)| {
+            let (fw, fh, rgba) = probe.frame.clone();
+            let thumbnail =
+                media_image::thumbnail_from_rgba(fw, fh, rgba).map_err(|e| e.to_string())?;
+            Ok((probe, converted, thumbnail))
+        });
+        match probed {
+            Ok((probe, converted, thumbnail)) => {
+                if let Some(bytes) = converted {
+                    item.bytes = bytes;
+                    item.file_name = mp4_name(&item.file_name);
+                }
+                item.mimetype = "video/mp4".into();
+                item.kind = video_from_probe(&probe, thumbnail, pending.gif);
+                if pending.index == 0 {
+                    self.preview = Some(probe.frame);
+                }
+            }
+            Err(e) => {
+                tracing::info!(error = %e, gif = pending.gif, "video not readable, sent as a file");
+                self.problems.push(format!(
+                    "{}: can't be played here, it will be sent as a file.",
+                    item.file_name
+                ));
+            }
+        }
+    }
+}
+
+/// `funny.gif` → `funny.mp4`.
+fn mp4_name(name: &str) -> String {
+    let stem = Path::new(name)
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "video".into());
+    format!("{stem}.mp4")
+}
+
+/// The [`OutgoingKind`](crate::net::OutgoingKind) of a probed video.
+pub fn video_from_probe(
+    probe: &crate::media::video::Probe,
+    thumbnail: Vec<u8>,
+    gif: bool,
+) -> crate::net::OutgoingKind {
+    crate::net::OutgoingKind::Video {
+        seconds: ((probe.duration_ms + 500) / 1000) as u32,
+        width: probe.width,
+        height: probe.height,
+        thumbnail,
+        gif,
+    }
+}
+
+/// Most time the helper gets to convert a GIF or read a video.
+const VIDEO_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Reads every pending video with the helper (GIFs are converted to MP4
+/// first, in a private temporary file removed right after). Async: the
+/// helper runs as a child process, never on the blocking pool.
+pub async fn finish_videos(mut staged: Staged) -> Staged {
+    static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    for pending in std::mem::take(&mut staged.videos) {
+        let result = async {
+            if !pending.gif {
+                let probe = crate::media::video::probe(&pending.path, VIDEO_WAIT)
+                    .await
+                    .map_err(|f| f.detail())?;
+                return Ok((probe, None));
+            }
+            let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let tmp =
+                std::env::temp_dir().join(format!("ferrochat-gif-{}-{n}.mp4", std::process::id()));
+            let out = async {
+                crate::media::video::gif_to_mp4(&pending.path, &tmp, VIDEO_WAIT)
+                    .await
+                    .map_err(|f| f.detail())?;
+                let probe = crate::media::video::probe(&tmp, VIDEO_WAIT)
+                    .await
+                    .map_err(|f| f.detail())?;
+                let bytes = tokio::fs::read(&tmp).await.map_err(|e| e.to_string())?;
+                Ok((probe, Some(bytes)))
+            }
+            .await;
+            let _ = tokio::fs::remove_file(&tmp).await;
+            out
+        }
+        .await;
+        staged.apply_probe(&pending, result);
+    }
+    staged
+}
+
+/// Prepares picked, pasted or dropped files, videos included. Async.
+pub async fn stage_paths(paths: Vec<PathBuf>, pasted: bool) -> Option<Staged> {
+    let staged = tokio::task::spawn_blocking(move || Staged::from_paths(paths, pasted))
+        .await
+        .ok()?;
+    Some(finish_videos(staged).await)
 }
 
 /// Turns what the clipboard holds into staged media; `None` for a text
-/// paste. Blocking (file reads, encoding).
+/// paste. Blocking (file reads, encoding); videos still need
+/// [`finish_videos`].
 pub fn stage(clip: Clipboard) -> Option<Staged> {
     match clip {
         Clipboard::Files(paths) => Some(Staged::from_paths(paths, true)),
@@ -569,5 +717,71 @@ mod tests {
         let out = p.into_outgoing();
         assert_eq!(out[0].caption.as_deref(), Some("look"));
         assert!(AttachPreview::new("chat".into(), Staged::default()).is_none());
+    }
+
+    #[test]
+    fn only_mp4_and_gif_go_as_videos() {
+        assert_eq!(video_kind(Path::new("/a/b.MP4")), Some(false));
+        assert_eq!(video_kind(Path::new("/a/b.m4v")), Some(false));
+        assert_eq!(video_kind(Path::new("/a/b.gif")), Some(true));
+        assert_eq!(video_kind(Path::new("/a/b.mov")), None);
+        assert_eq!(video_kind(Path::new("/a/b.webm")), None);
+        assert_eq!(video_kind(Path::new("/a/b.png")), None);
+        assert_eq!(mp4_name("baile.gif"), "baile.mp4");
+        assert_eq!(mp4_name(".gif"), ".gif.mp4");
+        assert_eq!(mp4_name(""), "video.mp4");
+    }
+
+    fn probe() -> crate::media::video::Probe {
+        crate::media::video::Probe {
+            width: 640,
+            height: 360,
+            duration_ms: 2600,
+            frame: (16, 9, vec![90; 16 * 9 * 4]),
+        }
+    }
+
+    #[test]
+    fn a_probe_turns_a_staged_file_into_a_video() {
+        let dir = std::env::temp_dir().join(format!("ferrochat-pv-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mp4 = dir.join("a.mp4");
+        let gif = dir.join("b.gif");
+        std::fs::write(&mp4, b"x").unwrap();
+        std::fs::write(&gif, b"y").unwrap();
+        let mut s = Staged::from_paths(vec![mp4, gif], false);
+        assert_eq!(s.videos.len(), 2);
+        assert_eq!(s.items[0].kind, OutgoingKind::Document, "until probed");
+        let pending = std::mem::take(&mut s.videos);
+        s.apply_probe(&pending[0], Ok((probe(), None)));
+        match &s.items[0].kind {
+            OutgoingKind::Video {
+                seconds,
+                width,
+                gif,
+                thumbnail,
+                ..
+            } => {
+                assert_eq!((*seconds, *width, *gif), (3, 640, false));
+                assert!(!thumbnail.is_empty());
+            }
+            k => panic!("{k:?}"),
+        }
+        assert_eq!(s.preview.as_ref().map(|p| (p.0, p.1)), Some((16, 9)));
+        s.apply_probe(&pending[1], Ok((probe(), Some(b"mp4!".to_vec()))));
+        assert_eq!(s.items[1].bytes, b"mp4!");
+        assert_eq!(s.items[1].file_name, "b.mp4");
+        assert!(matches!(
+            s.items[1].kind,
+            OutgoingKind::Video { gif: true, .. }
+        ));
+        // A failed probe leaves a document and says why.
+        let mut s = Staged::from_paths(vec![dir.join("a.mp4")], false);
+        let pending = std::mem::take(&mut s.videos);
+        s.apply_probe(&pending[0], Err("no".into()));
+        assert_eq!(s.items[0].kind, OutgoingKind::Document);
+        assert_eq!(s.items[0].mimetype, "video/mp4");
+        assert!(s.problems[0].contains("sent as a file"));
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

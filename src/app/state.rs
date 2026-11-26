@@ -233,6 +233,9 @@ pub struct ChatList {
     members: HashMap<String, HashSet<String>>,
     /// JID → position in `entries` (O(1) lookups during history sync).
     index: HashMap<String, usize>,
+    /// Chats marked unread by hand (here or on another device) since start:
+    /// reading them must tell the other devices too.
+    marked_unread: HashSet<String>,
 }
 
 impl ChatList {
@@ -251,6 +254,7 @@ impl ChatList {
             lists: Vec::new(),
             members: HashMap::new(),
             index: HashMap::new(),
+            marked_unread: HashSet::new(),
         };
         list.sort();
         list
@@ -555,7 +559,7 @@ impl ChatList {
         match flag {
             ChatFlag::Archived(v) => e.meta.archived = v,
             ChatFlag::Pinned(v) => e.meta.pinned = v,
-            ChatFlag::Muted(v) => e.meta.muted = v,
+            ChatFlag::Muted(end) => e.meta.mute_end = end,
         }
         self.sort();
     }
@@ -696,10 +700,40 @@ impl ChatList {
     }
 
     /// Clears the unread badge.
-    pub fn mark_read(&mut self, chat: &str) {
+    /// Clears the badge. True when the chat had been marked unread by hand,
+    /// so the other devices must hear that it was read.
+    pub fn mark_read(&mut self, chat: &str) -> bool {
         if let Some(e) = self.get_mut(chat) {
             e.meta.unread = 0;
         }
+        self.marked_unread.remove(chat)
+    }
+
+    /// Sets the badge (restoring it after a failed sync).
+    pub fn set_unread(&mut self, chat: &str, unread: u32) {
+        if let Some(e) = self.get_mut(chat) {
+            e.meta.unread = unread;
+        }
+    }
+
+    /// "Clear chat": the row stays, without a last message or badge.
+    pub fn clear_chat(&mut self, chat: &str) {
+        if let Some(e) = self.get_mut(chat) {
+            e.meta.unread = 0;
+            e.last = None;
+        }
+        self.marked_unread.remove(chat);
+    }
+
+    /// "Delete chat": the row goes. True when it existed.
+    pub fn delete_chat(&mut self, chat: &str) -> bool {
+        self.marked_unread.remove(chat);
+        let Some(i) = self.index.get(chat).copied() else {
+            return false;
+        };
+        self.entries.remove(i);
+        self.reindex();
+        true
     }
 
     /// Rows of the main list matching the search query and filter. Archived
@@ -736,24 +770,26 @@ impl ChatList {
     /// The number on the rail's Chats icon: unread chats, like WhatsApp
     /// Desktop (chats, not messages; archived and muted chats and status /
     /// channel pseudo-chats excluded).
-    pub fn unread_chats(&self) -> usize {
+    pub fn unread_chats(&self, now: i64) -> usize {
         self.entries
             .iter()
             .filter(|e| {
                 e.meta.unread > 0
                     && !e.meta.archived
-                    && !e.meta.muted
+                    && !e.meta.is_muted(now)
                     && !crate::net::is_pseudo_chat(&e.meta.id)
             })
             .count()
     }
 
-    /// Marks a chat unread from another device (keeps a real count).
+    /// Marks a chat unread by hand, here or on another device (keeps a
+    /// real count).
     pub fn mark_unread(&mut self, chat: &str) {
-        if let Some(e) = self.get_mut(chat)
-            && e.meta.unread == 0
-        {
-            e.meta.unread = 1;
+        if let Some(e) = self.get_mut(chat) {
+            if e.meta.unread == 0 {
+                e.meta.unread = 1;
+            }
+            self.marked_unread.insert(chat.to_string());
         }
     }
 
@@ -1117,6 +1153,7 @@ pub fn day_label(day: i64, today: i64, weekday: &str, date: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::net::types::MUTE_FOREVER;
 
     fn m(chat: &str, id: &str, ts: i64, from_me: bool) -> Message {
         Message {
@@ -1139,6 +1176,7 @@ mod tests {
             expires_at: None,
             reply: None,
             edited: false,
+            forwarded: None,
             mentions: Vec::new(),
             reactions: Vec::new(),
         }
@@ -1417,8 +1455,8 @@ mod tests {
         l.apply_flag("a", ChatFlag::Pinned(true));
         assert_eq!(l.pinned_count(), 1);
         assert_eq!(l.entries[0].meta.id, "a", "pinned chats sort first");
-        l.apply_flag("a", ChatFlag::Muted(true));
-        assert!(l.get("a").unwrap().meta.muted);
+        l.apply_flag("a", ChatFlag::Muted(MUTE_FOREVER));
+        assert!(l.get("a").unwrap().meta.is_muted(i64::MAX));
         // A flag for an unknown chat creates the row.
         l.apply_flag("new@s.whatsapp.net", ChatFlag::Archived(true));
         assert_eq!(l.archived_count(), 1);
@@ -1445,21 +1483,48 @@ mod tests {
             ],
             &[],
         );
-        l.apply_flag("muted@s.whatsapp.net", ChatFlag::Muted(true));
+        l.apply_flag("muted@s.whatsapp.net", ChatFlag::Muted(MUTE_FOREVER));
         l.apply_flag("arch@s.whatsapp.net", ChatFlag::Archived(true));
         assert_eq!(
-            l.unread_chats(),
+            l.unread_chats(100),
             2,
             "a and b; not messages, status, channels, muted or archived"
         );
-        l.mark_read("a@s.whatsapp.net");
-        assert_eq!(l.unread_chats(), 1);
+        assert!(!l.mark_read("a@s.whatsapp.net"), "not marked by hand");
+        assert_eq!(l.unread_chats(100), 1);
         // Marked unread on the phone: one, without inventing a count.
         l.mark_unread("c@s.whatsapp.net");
         assert_eq!(l.get("c@s.whatsapp.net").unwrap().meta.unread, 1);
         l.mark_unread("b@s.whatsapp.net");
         assert_eq!(l.get("b@s.whatsapp.net").unwrap().meta.unread, 3);
-        assert_eq!(l.unread_chats(), 2);
+        assert_eq!(l.unread_chats(100), 2);
+        // Reading a chat marked by hand must be told to the other devices,
+        // once.
+        assert!(l.mark_read("c@s.whatsapp.net"));
+        assert!(!l.mark_read("c@s.whatsapp.net"));
+        // A timed mute stops counting once it ends.
+        l.apply_flag("muted@s.whatsapp.net", ChatFlag::Muted(200));
+        assert_eq!(l.unread_chats(100), 1);
+        assert_eq!(l.unread_chats(200), 2);
+    }
+
+    #[test]
+    fn clearing_keeps_the_row_and_deleting_drops_it() {
+        let mut l = list();
+        l.mark_unread("a");
+        l.clear_chat("a");
+        let a = l.get("a").unwrap();
+        assert!(a.last.is_none());
+        assert_eq!(a.meta.unread, 0);
+        assert!(!l.mark_read("a"), "clearing forgets the manual mark");
+        let before = l.entries.len();
+        assert!(l.delete_chat("a"));
+        assert!(l.get("a").is_none());
+        assert_eq!(l.entries.len(), before - 1);
+        assert!(!l.delete_chat("a"));
+        // The index still finds the others.
+        let other = l.entries[0].meta.id.clone();
+        assert!(l.get(&other).is_some());
     }
 
     #[test]
@@ -1832,6 +1897,7 @@ mod mention_tests {
             expires_at: None,
             reply: None,
             edited: false,
+            forwarded: None,
             mentions: vec![LID.into()],
             reactions: Vec::new(),
         };
@@ -1868,6 +1934,7 @@ mod read_state_tests {
             expires_at: None,
             reply: None,
             edited: false,
+            forwarded: None,
             mentions: Vec::new(),
             reactions: Vec::new(),
         };

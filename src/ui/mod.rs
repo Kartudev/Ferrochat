@@ -4,10 +4,12 @@ pub mod call;
 pub mod chat;
 pub mod emoji_font;
 pub mod emoji_picker;
+pub mod forward;
 pub mod icons;
 pub mod info;
 pub mod login;
 pub mod measure;
+pub mod msg_info;
 pub mod nav;
 pub mod settings;
 pub mod sidebar;
@@ -98,7 +100,13 @@ pub fn view(app: &App) -> El<'_> {
     if let Some(d) = sidebar::list_dialog(app) {
         layers.push(d);
     }
+    if let Some(d) = sidebar::chat_dialog(app) {
+        layers.push(d);
+    }
     if let Some(d) = chat::dialog(app) {
+        layers.push(d);
+    }
+    if let Some(d) = forward::dialog(app) {
         layers.push(d);
     }
     if let Some(c) = call::panel(app) {

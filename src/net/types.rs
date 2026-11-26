@@ -160,6 +160,11 @@ pub enum Content {
         thumbnail: Option<Vec<u8>>,
         /// Where to fetch the video.
         media: Option<MediaRef>,
+        /// A GIF (WhatsApp sends GIFs as silent MP4s with `gifPlayback`):
+        /// labelled "GIF" and looped. Rows cached before this field read as
+        /// plain videos.
+        #[serde(default)]
+        gif: bool,
     },
     /// A sticker (WebP). Rendered statically: animated ones show frame 1.
     Sticker {
@@ -196,9 +201,13 @@ impl Content {
             },
             Content::Document { file_name, .. } => format!("📄 {file_name}"),
             Content::Video {
-                caption, seconds, ..
+                caption,
+                seconds,
+                gif,
+                ..
             } => match caption {
-                Some(c) if !c.is_empty() => format!("🎥 {c}"),
+                Some(c) if !c.is_empty() => format!("{} {c}", if *gif { "GIF" } else { "🎥" }),
+                _ if *gif => "GIF".into(),
                 _ => format!("🎥 {}", format_duration(*seconds)),
             },
             Content::Sticker { .. } => "Sticker".into(),
@@ -218,6 +227,18 @@ impl Content {
     pub fn text(&self) -> Option<&str> {
         match self {
             Content::Text(t) | Content::Link { text: t, .. } => Some(t),
+            _ => None,
+        }
+    }
+
+    /// Mutable access to the media reference (a re-upload moves it).
+    pub fn media_mut(&mut self) -> Option<&mut MediaRef> {
+        match self {
+            Content::Image { media, .. }
+            | Content::Document { media, .. }
+            | Content::Video { media, .. }
+            | Content::Sticker { media, .. }
+            | Content::Voice { media, .. } => media.as_mut(),
             _ => None,
         }
     }
@@ -375,6 +396,9 @@ pub struct Message {
     /// JIDs mentioned in the text (`contextInfo.mentionedJid`): PN or LID,
     /// the text then carries "@<user part>".
     pub mentions: Vec<String>,
+    /// Forwarded: `Some(contextInfo.forwardingScore)`, `None` when the
+    /// message was not forwarded.
+    pub forwarded: Option<u32>,
 }
 
 impl fmt::Debug for Message {
@@ -398,6 +422,7 @@ impl fmt::Debug for Message {
             .field("edited", &self.edited)
             .field("reactions", &self.reactions.len())
             .field("mentions", &self.mentions.len())
+            .field("forwarded", &self.forwarded)
             .finish_non_exhaustive()
     }
 }
@@ -551,6 +576,45 @@ impl Message {
             && now - self.timestamp <= REVOKE_WINDOW_SECS
     }
 
+    /// Shown as "Forwarded many times" (WhatsApp's frequently forwarded
+    /// mark, double arrow). Such messages go to one chat at a time.
+    pub fn frequently_forwarded(&self) -> bool {
+        self.forwarded
+            .is_some_and(|s| s >= FREQUENTLY_FORWARDED_SCORE)
+    }
+
+    /// The message can be forwarded: something the recipient can open
+    /// (text or media still on the CDN), and ours only once it was sent.
+    pub fn can_forward(&self) -> bool {
+        let content = match &self.content {
+            Content::Text(_) | Content::Link { .. } => true,
+            Content::Image { media, .. }
+            | Content::Document { media, .. }
+            | Content::Voice { media, .. }
+            | Content::Video { media, .. }
+            | Content::Sticker { media, .. } => {
+                media.as_ref().is_some_and(|m| !m.media_key.is_empty())
+            }
+            Content::Unsupported(_) | Content::ViewOnce | Content::Deleted | Content::Call(_) => {
+                false
+            }
+        };
+        content
+            && !(self.from_me
+                && matches!(self.status, ReceiptStatus::Pending | ReceiptStatus::Failed))
+    }
+
+    /// The forwarding score a forward of this message carries
+    /// (`prepare_for_forward` in the library: the source score, plus one if
+    /// the source was already a forward, jumping to 127 from 5 on).
+    pub fn forward_score(&self) -> u32 {
+        match self.forwarded {
+            None => 0,
+            Some(s) if s.saturating_add(1) >= FREQUENTLY_FORWARDED_SCORE => 127,
+            Some(s) => s + 1,
+        }
+    }
+
     /// Protocol key of this message.
     pub fn key(&self) -> MsgKey {
         MsgKey {
@@ -577,8 +641,29 @@ pub struct ChatMeta {
     pub pinned: bool,
     /// Archived.
     pub archived: bool,
-    /// Muted.
-    pub muted: bool,
+    /// When the mute ends: [`MUTE_OFF`], [`MUTE_FOREVER`] or Unix seconds.
+    pub mute_end: i64,
+}
+
+/// Forwarding score from which a message is "forwarded many times".
+pub const FREQUENTLY_FORWARDED_SCORE: u32 = 5;
+
+/// [`ChatMeta::mute_end`] of a chat that is not muted.
+pub const MUTE_OFF: i64 = 0;
+/// [`ChatMeta::mute_end`] of a chat muted until unmuted ("Always").
+pub const MUTE_FOREVER: i64 = -1;
+
+/// Whether a mute ending at `end` (see [`ChatMeta::mute_end`]) still holds
+/// at `now` (Unix seconds).
+pub fn mute_active(end: i64, now: i64) -> bool {
+    end < 0 || end > now
+}
+
+impl ChatMeta {
+    /// Muted at `now` (Unix seconds): timed mutes end on their own.
+    pub fn is_muted(&self, now: i64) -> bool {
+        mute_active(self.mute_end, now)
+    }
 }
 
 /// Where a batch of messages comes from. Decides unread counting and
@@ -880,8 +965,9 @@ pub enum ChatFlag {
     Archived(bool),
     /// Pinned / unpinned.
     Pinned(bool),
-    /// Muted / unmuted.
-    Muted(bool),
+    /// Muted until this time (see [`ChatMeta::mute_end`]); [`MUTE_OFF`]
+    /// unmutes.
+    Muted(i64),
 }
 
 /// What a chat list "label" is (WhatsApp's `LabelEditAction.ListType`).
@@ -971,6 +1057,20 @@ pub enum OutgoingKind {
     },
     /// Any file.
     Document,
+    /// MP4 video (H.264) with what the helper read from it. GIFs are sent
+    /// as silent MP4s like WhatsApp does (`gif`).
+    Video {
+        /// Duration in seconds.
+        seconds: u32,
+        /// Pixel width.
+        width: u32,
+        /// Pixel height.
+        height: u32,
+        /// Small JPEG thumbnail of the first frame.
+        thumbnail: Vec<u8>,
+        /// Played as a looping, silent GIF.
+        gif: bool,
+    },
     /// Voice note (Ogg/Opus).
     Voice {
         /// Duration in seconds.
@@ -1002,6 +1102,21 @@ impl OutgoingMedia {
                 pages: None,
                 caption: self.caption.clone(),
                 media,
+            },
+            OutgoingKind::Video {
+                seconds,
+                width,
+                height,
+                thumbnail,
+                gif,
+            } => Content::Video {
+                caption: self.caption.clone(),
+                seconds: *seconds,
+                width: *width,
+                height: *height,
+                thumbnail: Some(thumbnail.clone()),
+                media,
+                gif: *gif,
             },
             OutgoingKind::Voice { seconds, waveform } => Content::Voice {
                 seconds: *seconds,
@@ -1133,6 +1248,7 @@ mod tests {
             expires_at: None,
             reply: None,
             edited: false,
+            forwarded: None,
             mentions: Vec::new(),
             reactions: Vec::new(),
         }
@@ -1223,8 +1339,19 @@ mod tests {
             height: 1,
             thumbnail: None,
             media: None,
+            gif: false,
         };
         assert_eq!(v.preview(), "🎥 1:15");
+        let g = Content::Video {
+            caption: None,
+            seconds: 3,
+            width: 1,
+            height: 1,
+            thumbnail: None,
+            media: None,
+            gif: true,
+        };
+        assert_eq!(g.preview(), "GIF");
         assert_eq!(v.kind_tag(), "video");
         let s = Content::Sticker {
             width: 1,

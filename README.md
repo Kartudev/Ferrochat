@@ -18,17 +18,17 @@ dark theme.
 ## Install / update
 
 Linux x86_64, no root needed. One command installs and updates (it downloads
-the latest [release](https://github.com/FerroApps/Ferrochat/releases/latest), checks
+the latest [release](https://github.com/Kartudev/Ferrochat-kartu/releases/latest), checks
 its SHA-256 and puts the binary, menu entry and icon under `~/.local`):
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/FerroApps/Ferrochat/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/Kartudev/Ferrochat-kartu/main/install.sh | sh
 ```
 
 Uninstall (removes only what the installer added, never your account data):
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/FerroApps/Ferrochat/main/install.sh | sh -s -- --uninstall
+curl -fsSL https://raw.githubusercontent.com/Kartudev/Ferrochat-kartu/main/install.sh | sh -s -- --uninstall
 ```
 
 Manual alternative: download `ferrochat-vX.Y.Z-linux-x86_64.tar.gz` and its
@@ -56,6 +56,18 @@ automatic check off in Settings; it only asks GitHub for the latest release.
 |---|---|---|
 | ![](docs/screenshots/reply.png) | ![](docs/screenshots/reactions.png) | ![](docs/screenshots/chat-search.png) |
 
+| Select messages | Forward |
+|---|---|
+| ![](docs/screenshots/select.png) | ![](docs/screenshots/forward.png) |
+
+| Send a video | Send a GIF | Drag and drop |
+|---|---|---|
+| ![](docs/screenshots/attach-video.png) | ![](docs/screenshots/attach-gif.png) | ![](docs/screenshots/drop.png) |
+
+| Message info | Message info in a group |
+|---|---|
+| ![](docs/screenshots/message-info.png) | ![](docs/screenshots/group-message-info.png) |
+
 ## Features
 
 * QR-code pairing as a linked device (codes refresh automatically, reload
@@ -64,8 +76,11 @@ automatic check off in Settings; it only asks GitHub for the latest release.
   unread badges, pinned and muted markers, last-message preview with ticks.
 * History from WhatsApp's history sync, cached in SQLite; older pages load
   when scrolling up.
-* Send and receive text, photos, documents and voice notes (record with the
-  mic button, play back with a waveform).
+* Send and receive text, photos, videos, GIFs, documents and voice notes
+  (record with the mic button, play back with a waveform). MP4s go as
+  videos and GIFs are converted to silent MP4s like WhatsApp does; pick,
+  paste or drag and drop files onto the chat (drag and drop needs X11 /
+  XWayland, Windows or macOS: winit has none on native Wayland yet).
 * Read receipts, both ways: grey / blue ticks on your messages, read and
   played receipts sent when you open a chat or play a voice note.
 * Profile pictures for chats and contacts (bounded in-memory LRU plus a disk
@@ -73,13 +88,20 @@ automatic check off in Settings; it only asks GitHub for the latest release.
 * Replies (quoted message, click to jump, reply bar), reactions (badge, who
   reacted, hover picker, send and remove), edit (15 min) and delete for me /
   for everyone, "Edited" marker.
+* Forward messages to up to five chats at once, from the message menu or by
+  selecting several messages; "Forwarded" / "Forwarded many times" marks.
 * Typing and recording indicators, online / last seen, and our own throttled
   "typing…" presence.
 * Search in the chat list (chats and cached messages) and inside a chat, with
   jump to the result.
-* Video (thumbnail and duration, opens in the system player) and stickers
+* Video (thumbnail and duration, plays in the app; GIFs are labelled and
+  loop) and stickers
   (WebP, static; animated ones show their first frame).
 * Group ticks turn blue only once every participant has read the message.
+* Message info for your messages: when it was delivered, read or played,
+  and in groups who has read it and who has only received it.
+* Old media whose server copy has expired is re-requested from the sender's
+  phone and downloaded again (also before forwarding old media).
 * Desktop notifications (sender + preview, or sender only).
 
 See [docs/protocol.md](docs/protocol.md) for what works, what is stored on
@@ -103,7 +125,8 @@ PipeWire, D-Bus, a Secret Service (KWallet or GNOME Keyring) and
 `xdg-open`. Videos play inside the app through a small helper,
 `ferrochat-player` (installed next to `ferrochat`) that needs no codec
 package: it decodes MP4 with H.264 (OpenH264, built from source and linked
-statically) and AAC (symphonia, pure Rust). Videos in other formats (H.265)
+statically) and AAC (symphonia, pure Rust); it also reads videos before
+they are sent and turns GIFs into MP4 (OpenH264's encoder). Videos in other formats (H.265)
 show which codec is missing and an "Open externally" button. Build with
 `--no-default-features` to leave the helper out. Linux (KDE Plasma / Wayland) is the primary
 target; Windows and macOS should build but are not tested.

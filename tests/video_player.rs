@@ -313,3 +313,71 @@ async fn the_first_frame_makes_a_poster() {
             .is_err()
     );
 }
+
+/// A small animated GIF: `frames` frames of `w`x`h`, `delay_ms` each, with a
+/// moving bar and a transparent corner.
+fn write_gif(path: &Path, w: u32, h: u32, frames: u32, delay_ms: u32) {
+    use image::codecs::gif::{GifEncoder, Repeat};
+    use image::{Delay, Frame, Rgba, RgbaImage};
+    let file = std::fs::File::create(path).unwrap();
+    let mut enc = GifEncoder::new(file);
+    enc.set_repeat(Repeat::Infinite).unwrap();
+    for i in 0..frames {
+        let img = RgbaImage::from_fn(w, h, |x, y| {
+            if x < 4 && y < 4 {
+                Rgba([0, 0, 0, 0])
+            } else if x / 8 == i % (w / 8) {
+                Rgba([220, 40, 40, 255])
+            } else {
+                Rgba([20, 90, 200, 255])
+            }
+        });
+        let frame = Frame::from_parts(img, 0, 0, Delay::from_numer_denom_ms(delay_ms, 1));
+        enc.encode_frame(frame).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn a_gif_becomes_a_playable_silent_mp4() {
+    let dir = tmp("gif");
+    let gif = dir.join("in.gif");
+    let mp4 = dir.join("out.mp4");
+    // Odd sizes on purpose: the MP4 needs even ones.
+    write_gif(&gif, 101, 61, 12, 80);
+    video::gif_to_mp4_with(Path::new(HELPER), &gif, &mp4, WAIT)
+        .await
+        .expect("converted");
+    let probe = video::probe_with(Path::new(HELPER), &mp4, WAIT)
+        .await
+        .expect("the converted file plays");
+    assert_eq!((probe.width, probe.height), (100, 60));
+    assert!(
+        (800..=1100).contains(&probe.duration_ms),
+        "duration {}",
+        probe.duration_ms
+    );
+    assert_eq!(probe.frame.2.len(), 100 * 60 * 4);
+    // The transparent corner is white, the rest keeps its colour.
+    let px = |x: usize, y: usize| {
+        let i = (y * 100 + x) * 4;
+        probe.frame.2[i..i + 3].to_vec()
+    };
+    assert!(px(1, 1).iter().all(|&c| c > 200), "corner {:?}", px(1, 1));
+    let blue = px(50, 50);
+    assert!(blue[2] > 150 && blue[0] < 90, "body {blue:?}");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn a_broken_gif_fails_cleanly_and_leaves_no_file() {
+    let dir = tmp("badgif");
+    let gif = dir.join("in.gif");
+    let mp4 = dir.join("out.mp4");
+    std::fs::write(&gif, b"GIF89a not really").unwrap();
+    let err = video::gif_to_mp4_with(Path::new(HELPER), &gif, &mp4, WAIT)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Failure::Broken(_)), "{err:?}");
+    assert!(!mp4.exists());
+    let _ = std::fs::remove_dir_all(dir);
+}

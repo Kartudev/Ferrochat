@@ -90,7 +90,8 @@ fn history_sync_fixture_converts() {
     assert_eq!(dm.last_ts, 1_700_000_500);
     let group = &chats[1];
     assert_eq!(group.name.as_deref(), Some("Book club"));
-    assert!(group.archived && group.muted);
+    assert!(group.archived && group.is_muted(1_700_001_000));
+    assert_eq!(group.mute_end, 4_000_000_000);
     assert_eq!(messages.len(), 2);
     let mine = messages.iter().find(|m| m.from_me).unwrap();
     assert_eq!(mine.status, ReceiptStatus::Read);

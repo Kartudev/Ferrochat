@@ -73,6 +73,8 @@ pub enum Ui {
     Attach,
     /// Ctrl+V / Shift+Insert: a copied image or files open the preview.
     Paste,
+    /// Files dragged over or dropped on the window.
+    Drop(crate::app::drop::DropMsg),
     /// Attachment preview caption edited.
     AttachCaption(String),
     /// Attachment preview "send".
@@ -132,6 +134,10 @@ pub enum Ui {
     ToggleInfo,
     /// Close the info drawer.
     CloseInfo,
+    /// "Message info" from the menu of one of our messages.
+    MessageInfo(String),
+    /// Close the "Message info" panel.
+    CloseMessageInfo,
     /// Open a gallery tab of the info drawer (`None` = back).
     InfoGallery(Option<crate::app::info::Tab>),
     /// Mute / unmute a chat.
@@ -295,6 +301,10 @@ pub enum Ui {
     ConfirmDeleteList(String),
     /// Close the list dialog.
     CloseListDialog,
+    /// Forward messages / selection mode.
+    Forward(crate::app::forward::Fwd),
+    /// Mark read / unread, mute, clear or delete a chat.
+    ChatAct(crate::app::chat_actions::ChatAct),
     /// Open a link from a message in the default browser.
     OpenLink(String),
     /// Open a message found by the chat list search.
@@ -521,6 +531,12 @@ pub enum Done {
     },
     /// An info drawer query finished.
     Info(Box<crate::app::info::InfoDone>),
+    /// The receipts of the "Message info" panel were read.
+    MsgInfo {
+        chat: String,
+        id: String,
+        rows: Vec<crate::store::ReceiptDetail>,
+    },
     /// A photo was saved / handed to the system viewer (`None` = cancelled).
     ViewerSaved(Result<Option<PathBuf>, String>),
     /// Voice note downloaded and decoded.
@@ -588,6 +604,8 @@ pub enum Done {
     },
     /// A task started by a navigation / status action finished.
     Nav(Box<crate::app::nav::NavDone>),
+    /// A chat action task finished.
+    ChatAct(crate::app::chat_actions::ChatActDone),
     /// Nothing to do.
     Nothing,
     /// A call task finished.

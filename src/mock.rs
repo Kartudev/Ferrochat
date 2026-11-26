@@ -266,9 +266,17 @@ impl B {
             expires_at: None,
             reply: None,
             edited: false,
+            forwarded: None,
             mentions: Vec::new(),
             reactions: Vec::new(),
         });
+    }
+
+    /// Marks the message pushed last as forwarded with this score.
+    fn forwarded(&mut self, score: u32) {
+        if let Some(m) = self.msgs.last_mut() {
+            m.forwarded = Some(score);
+        }
     }
 
     /// Id of the message pushed last.
@@ -541,6 +549,7 @@ pub fn mock_data(now: i64) -> MockData {
             height: 180,
             thumbnail: clip_thumb.clone(),
             media: Some(clip_ref.clone()),
+            gif: false,
         },
         Read,
     );
@@ -574,6 +583,7 @@ pub fn mock_data(now: i64) -> MockData {
         text("Mira esto https://www.rust-lang.org/learn y también www.example.com."),
         Read,
     );
+    b.forwarded(0);
     b.push(
         lucia,
         None,
@@ -749,7 +759,7 @@ pub fn mock_data(now: i64) -> MockData {
         last_ts: last_of(id),
         pinned,
         archived: false,
-        muted,
+        mute_end: if muted { crate::net::MUTE_FOREVER } else { 0 },
     };
     let mut chats = vec![
         chat(lucia, None, 0, true, false),
@@ -1007,11 +1017,47 @@ pub fn long_history(chat: &str, n: usize, until: i64) -> Vec<Message> {
                 expires_at: None,
                 reply: None,
                 edited: false,
+                forwarded: None,
                 mentions: Vec::new(),
                 reactions: Vec::new(),
             }
         })
         .collect()
+}
+
+/// A small animated GIF (a bouncing ball, 12 frames) for the "attach-gif"
+/// screenshot. Empty when encoding fails.
+pub fn sample_gif() -> Vec<u8> {
+    use image::codecs::gif::{GifEncoder, Repeat};
+    let (w, h) = (320u32, 200u32);
+    let mut out = Vec::new();
+    {
+        let mut enc = GifEncoder::new(&mut out);
+        if enc.set_repeat(Repeat::Infinite).is_err() {
+            return Vec::new();
+        }
+        for i in 0..12u32 {
+            let t = i as f32 / 12.0;
+            let cx = 40.0 + t * 240.0;
+            let cy = 150.0 - (t * std::f32::consts::PI).sin() * 100.0;
+            let img = image::RgbaImage::from_fn(w, h, |x, y| {
+                let d = ((x as f32 - cx).powi(2) + (y as f32 - cy).powi(2)).sqrt();
+                if d < 22.0 {
+                    image::Rgba([255, 196, 0, 255])
+                } else if y > 176 {
+                    image::Rgba([60, 150, 90, 255])
+                } else {
+                    image::Rgba([120, 180, 235, 255])
+                }
+            });
+            let frame =
+                image::Frame::from_parts(img, 0, 0, image::Delay::from_numer_denom_ms(80, 1));
+            if enc.encode_frame(frame).is_err() {
+                return Vec::new();
+            }
+        }
+    }
+    out
 }
 
 #[cfg(test)]

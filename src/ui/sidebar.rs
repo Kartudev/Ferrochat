@@ -2,7 +2,8 @@
 
 use iced::widget::text::Wrapping;
 use iced::widget::{
-    Space, button, column, container, mouse_area, opaque, row, scrollable, stack, text, text_input,
+    Space, button, checkbox, column, container, mouse_area, opaque, radio, row, scrollable, stack,
+    text, text_input,
 };
 use iced::{Alignment, Length};
 
@@ -10,6 +11,7 @@ use super::emoji_font::emoji_text;
 use super::icons::Icon;
 use super::theme::{self, INTER_MEDIUM, INTER_SEMIBOLD};
 use super::{El, avatar_for, badge, ellipsize, fill, gap, icon, list_time, ticks};
+use crate::app::chat_actions::{ChatAct, ChatDialog, MuteFor};
 use crate::app::lists::{LIST_NAME_ID, MAX_LIST_NAME};
 use crate::app::nav::{NavMsg, Section};
 use crate::app::state::{ChatEntry, Filter};
@@ -54,7 +56,7 @@ pub fn rail(app: &App) -> El<'_> {
     } else {
         Some(app.nav.section)
     };
-    let unread = app.chats.unread_chats() as u32;
+    let unread = app.unread_chats();
     let chats_active = current == Some(Section::Chats);
     let chats_item: El<'_> = if unread > 0 {
         stack![
@@ -553,16 +555,15 @@ fn chat_row<'a>(app: &'a App, e: &'a ChatEntry, now: i64) -> El<'a> {
         ));
     }
     preview_row = preview_row.push(fill());
-    if e.meta.muted {
+    let muted = app.is_muted(&e.meta.id);
+    if muted {
         preview_row = preview_row.push(icon(Icon::BellOff, 15.0, p.text_secondary));
     }
     if e.meta.pinned {
         preview_row = preview_row.push(icon(Icon::Pin, 15.0, p.text_secondary));
     }
     if unread > 0 {
-        preview_row = preview_row
-            .push(gap(4.0))
-            .push(badge(t, unread, e.meta.muted));
+        preview_row = preview_row.push(gap(4.0)).push(badge(t, unread, muted));
     }
 
     let content = column![
@@ -573,7 +574,7 @@ fn chat_row<'a>(app: &'a App, e: &'a ChatEntry, now: i64) -> El<'a> {
                 .wrapping(Wrapping::None)
                 .shaping(text::Shaping::Advanced),
             fill(),
-            text(time).size(12).color(if unread > 0 && !e.meta.muted {
+            text(time).size(12).color(if unread > 0 && !muted {
                 p.accent
             } else {
                 p.text_secondary
@@ -739,6 +740,22 @@ pub fn context_menu(app: &App) -> Option<El<'_>> {
                 Ui::ToggleArchive(chat.clone()),
                 false,
             ));
+            let muted = app.is_muted(chat);
+            col = col.push(item(
+                if muted {
+                    "Unmute notifications"
+                } else {
+                    "Mute notifications"
+                }
+                .into(),
+                Icon::BellOff,
+                Ui::ChatAct(if muted {
+                    ChatAct::Unmute(chat.clone())
+                } else {
+                    ChatAct::AskMute(chat.clone())
+                }),
+                false,
+            ));
             col = col.push(item(
                 if e.meta.pinned {
                     "Unpin chat"
@@ -748,6 +765,26 @@ pub fn context_menu(app: &App) -> Option<El<'_>> {
                 .into(),
                 Icon::Pin,
                 Ui::TogglePin(chat.clone()),
+                false,
+            ));
+            let unread = e.meta.unread > 0;
+            col = col.push(item(
+                if unread {
+                    "Mark as read"
+                } else {
+                    "Mark as unread"
+                }
+                .into(),
+                if unread {
+                    Icon::CheckCheck
+                } else {
+                    Icon::MessageCircle
+                },
+                Ui::ChatAct(if unread {
+                    ChatAct::MarkRead(chat.clone())
+                } else {
+                    ChatAct::MarkUnread(chat.clone())
+                }),
                 false,
             ));
             col = col.push(item(
@@ -761,7 +798,7 @@ pub fn context_menu(app: &App) -> Option<El<'_>> {
                 Ui::ToggleFavourite(chat.clone()),
                 false,
             ));
-            rows += 3;
+            rows += 5;
             for l in app.chats.custom_lists().take(8) {
                 let member = app.chats.in_list(&l.id, chat);
                 col = col.push(item(
@@ -779,6 +816,19 @@ pub fn context_menu(app: &App) -> Option<El<'_>> {
                 ));
                 rows += 1;
             }
+            col = col.push(item(
+                "Clear chat".into(),
+                Icon::CircleDashed,
+                Ui::ChatAct(ChatAct::AskClear(chat.clone())),
+                false,
+            ));
+            col = col.push(item(
+                "Delete chat".into(),
+                Icon::Trash2,
+                Ui::ChatAct(ChatAct::AskDelete(chat.clone())),
+                true,
+            ));
+            rows += 2;
         }
         MenuTarget::Chip(id) => {
             col = col.push(item(
@@ -912,6 +962,12 @@ pub fn list_dialog(app: &App) -> Option<El<'_>> {
             .into()
         }
     };
+    Some(modal(app, body))
+}
+
+/// A dialog card centred over a dimmed window.
+fn modal<'a>(app: &'a App, body: El<'a>) -> El<'a> {
+    let p = app.theme.palette;
     let card = container(body)
         .padding(24)
         .width(380)
@@ -924,7 +980,104 @@ pub fn list_dialog(app: &App) -> Option<El<'_>> {
             };
             s
         });
-    Some(opaque(container(card).center(Length::Fill).style(
-        theme::solid(iced::Color::from_rgba(0.0, 0.0, 0.0, 0.55)),
-    )))
+    opaque(
+        container(card)
+            .center(Length::Fill)
+            .style(theme::solid(iced::Color::from_rgba(0.0, 0.0, 0.0, 0.55))),
+    )
+}
+
+/// The mute / clear / delete chat dialog.
+pub fn chat_dialog(app: &App) -> Option<El<'_>> {
+    let d = app.chat_dialog.as_ref()?;
+    let t = &app.theme;
+    let p = t.palette;
+    let btn = |label: &'static str, on: ChatAct, danger: bool| -> El<'_> {
+        button(text(label).size(14.5).font(INTER_MEDIUM).color(if danger {
+            p.danger
+        } else {
+            p.accent
+        }))
+        .padding([9, 16])
+        .style(theme::link_button(t))
+        .on_press(Message::Ui(Ui::ChatAct(on)))
+        .into()
+    };
+    let name = |chat: &str| ellipsize(&app.chats.display_name(chat), 28);
+    let body: El<'_> = match d {
+        ChatDialog::Mute { chat, choice } => {
+            let mut col = column![
+                text(format!("Mute notifications from {}", name(chat)))
+                    .size(18)
+                    .color(p.text_primary)
+                    .shaping(text::Shaping::Advanced),
+                text("Other participants will not see that you muted this chat.")
+                    .size(14)
+                    .color(p.text_secondary),
+            ]
+            .spacing(10);
+            for c in MuteFor::ALL {
+                col = col.push(
+                    radio(c.label(), c, Some(*choice), |c| {
+                        Message::Ui(Ui::ChatAct(ChatAct::PickMute(c)))
+                    })
+                    .size(18)
+                    .spacing(14)
+                    .text_size(15)
+                    .style(theme::radio(t)),
+                );
+            }
+            col.push(
+                row![
+                    fill(),
+                    btn("Cancel", ChatAct::Cancel, false),
+                    btn("Mute", ChatAct::ConfirmMute, false),
+                ]
+                .spacing(4),
+            )
+            .into()
+        }
+        ChatDialog::Clear { chat, keep_starred } => column![
+            text(format!("Clear this chat with {}?", name(chat)))
+                .size(18)
+                .color(p.text_primary)
+                .shaping(text::Shaping::Advanced),
+            text("Messages will be removed from this device and your phone.")
+                .size(14)
+                .color(p.text_secondary),
+            checkbox(*keep_starred)
+                .label("Keep starred messages")
+                .on_toggle(|v| Message::Ui(Ui::ChatAct(ChatAct::KeepStarred(v))))
+                .size(18)
+                .spacing(14)
+                .text_size(15)
+                .style(theme::checkbox(t)),
+            row![
+                fill(),
+                btn("Cancel", ChatAct::Cancel, false),
+                btn("Clear chat", ChatAct::ConfirmClear, true),
+            ]
+            .spacing(4),
+        ]
+        .spacing(12)
+        .into(),
+        ChatDialog::Delete { chat } => column![
+            text(format!("Delete this chat with {}?", name(chat)))
+                .size(18)
+                .color(p.text_primary)
+                .shaping(text::Shaping::Advanced),
+            text("Messages will be removed from this device and your phone.")
+                .size(14)
+                .color(p.text_secondary),
+            row![
+                fill(),
+                btn("Cancel", ChatAct::Cancel, false),
+                btn("Delete chat", ChatAct::ConfirmDelete, true),
+            ]
+            .spacing(4),
+        ]
+        .spacing(10)
+        .into(),
+    };
+    Some(modal(app, body))
 }

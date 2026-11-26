@@ -49,8 +49,27 @@ pub trait WaClient: Send + Sync {
         id: &'a str,
         media: OutgoingMedia,
     ) -> BoxFuture<'a, Result<Content>>;
-    /// Downloads and decrypts a media blob.
+    /// Forwards a message (`source`, as cached) to `chat` with a
+    /// caller-chosen id. Media is relayed from the same CDN blob.
+    fn forward<'a>(
+        &'a self,
+        chat: &'a str,
+        id: &'a str,
+        source: &'a Message,
+    ) -> BoxFuture<'a, Result<()>>;
+    /// Downloads and decrypts a media blob. `Error::MediaExpired` when the
+    /// CDN no longer has it (see [`reupload`](Self::reupload)).
     fn download<'a>(&'a self, media: &'a MediaRef) -> BoxFuture<'a, Result<Vec<u8>>>;
+    /// Asks for expired media of message `key` to be uploaded again (the
+    /// "media retry" receipt WhatsApp sends: the phone that has the file
+    /// re-uploads it). `key` carries the JIDs the message came from (LIDs
+    /// included). Returns `media` with the new path; `Error::MediaGone` when
+    /// nobody has it any more.
+    fn reupload<'a>(
+        &'a self,
+        key: &'a MsgKey,
+        media: &'a MediaRef,
+    ) -> BoxFuture<'a, Result<MediaRef>>;
     /// Sends read receipts. `sender` is required for group messages.
     fn mark_read<'a>(
         &'a self,
@@ -164,8 +183,32 @@ pub trait WaClient: Send + Sync {
     fn is_blocked<'a>(&'a self, jid: &'a str) -> BoxFuture<'a, Result<bool>>;
     /// Blocks / unblocks a contact.
     fn set_blocked<'a>(&'a self, jid: &'a str, blocked: bool) -> BoxFuture<'a, Result<()>>;
-    /// Mutes a chat indefinitely / unmutes it (synced to the phone).
-    fn set_muted<'a>(&'a self, chat: &'a str, muted: bool) -> BoxFuture<'a, Result<()>>;
+    /// Mutes a chat until `end` (Unix seconds, or [`MUTE_FOREVER`]) or
+    /// unmutes it ([`MUTE_OFF`]); synced to the phone.
+    fn set_mute<'a>(&'a self, chat: &'a str, end: i64) -> BoxFuture<'a, Result<()>>;
+    /// Marks a chat read / unread on every device (app-state
+    /// `markChatAsRead`). `last` is the newest message and its time, which
+    /// lets the phone resolve conflicts.
+    fn mark_chat_read<'a>(
+        &'a self,
+        chat: &'a str,
+        read: bool,
+        last: Option<&'a (MsgKey, i64)>,
+    ) -> BoxFuture<'a, Result<()>>;
+    /// Clears a chat's messages but keeps the chat (app-state `clearChat`).
+    /// Starred messages survive when `keep_starred`.
+    fn clear_chat<'a>(
+        &'a self,
+        chat: &'a str,
+        keep_starred: bool,
+        last: Option<&'a (MsgKey, i64)>,
+    ) -> BoxFuture<'a, Result<()>>;
+    /// Deletes a chat and its messages (app-state `deleteChat`).
+    fn delete_chat<'a>(
+        &'a self,
+        chat: &'a str,
+        last: Option<&'a (MsgKey, i64)>,
+    ) -> BoxFuture<'a, Result<()>>;
     /// Declines a call ringing here (the library's `<reject>`).
     fn reject_call<'a>(&'a self, call_id: &'a str) -> BoxFuture<'a, Result<()>>;
     /// Answers a call ringing here with these audio ends. Progress arrives
@@ -273,6 +316,8 @@ pub enum Event {
         status: ReceiptStatus,
         /// Who the receipt is from (groups only).
         participant: Option<String>,
+        /// When it was sent (Unix seconds); 0 = unknown (local states).
+        timestamp: i64,
     },
     /// A reaction was added, changed or removed (`emoji` empty).
     Reaction {
@@ -374,6 +419,18 @@ pub enum Event {
         /// Chat.
         chat: ChatId,
     },
+    /// A chat's messages were cleared on another device (the chat stays).
+    ChatCleared {
+        /// Chat.
+        chat: ChatId,
+        /// Starred messages were kept.
+        keep_starred: bool,
+    },
+    /// A chat was deleted on another device.
+    ChatDeleted {
+        /// Chat.
+        chat: ChatId,
+    },
     /// New statuses (live or from the offline queue).
     Status(Vec<StatusItem>),
     /// A status was revoked by its author.
@@ -438,6 +495,8 @@ impl fmt::Debug for Event {
             Event::ListChat { member, .. } => write!(f, "ListChat(member={member})"),
             Event::ChatRead { .. } => write!(f, "ChatRead"),
             Event::ChatMarkedUnread { .. } => write!(f, "ChatMarkedUnread"),
+            Event::ChatCleared { .. } => write!(f, "ChatCleared"),
+            Event::ChatDeleted { .. } => write!(f, "ChatDeleted"),
             Event::Status(v) => write!(f, "Status(n={})", v.len()),
             Event::StatusRevoked { .. } => write!(f, "StatusRevoked"),
             Event::Star(c) => write!(f, "Star({})", c.starred),

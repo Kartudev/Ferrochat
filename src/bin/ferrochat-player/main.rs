@@ -1,6 +1,7 @@
 //! Video decoder helper for Ferrochat, with no system codec dependency.
 //!
-//! `ferrochat-player <file>` plays one MP4 file: H.264 video through
+//! `ferrochat-player <file>` plays one MP4 file (and `--gif-to-mp4 <in> <out>`
+//! converts a GIF for sending, see `gif.rs`): H.264 video through
 //! OpenH264 (Cisco's BSD-licensed decoder, built from source and linked
 //! statically), AAC audio through symphonia (pure Rust), sound through
 //! rodio. It writes RGBA frames and playback times to stdout and reads
@@ -16,6 +17,8 @@
 mod audio;
 #[cfg(unix)]
 mod demux;
+#[cfg(unix)]
+mod gif;
 #[cfg(unix)]
 mod yuv;
 
@@ -58,6 +61,17 @@ mod player {
     type Out = BufWriter<std::fs::File>;
 
     pub fn run() {
+        let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+        if args
+            .get(1)
+            .is_some_and(|a| a == ferrochat::media::video::GIF_TO_MP4_FLAG)
+        {
+            let (Some(input), Some(output)) = (args.get(2), args.get(3)) else {
+                eprintln!("usage: ferrochat-player --gif-to-mp4 <in.gif> <out.mp4>");
+                std::process::exit(2);
+            };
+            super::gif::run(Path::new(input), Path::new(output));
+        }
         let Some(path) = std::env::args().nth(1) else {
             eprintln!("usage: ferrochat-player <file>");
             std::process::exit(2);

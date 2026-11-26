@@ -66,6 +66,8 @@ conversion lives in pure functions in `src/net/convert.rs`.
 | `LabelEditUpdate` (app-state `label_edit`) | `ListEdit` | list created / renamed / deleted |
 | `LabelAssociationUpdate` (`label_jid`) | `ListChat` | chat added to / removed from a list |
 | `MarkChatAsReadUpdate` | `ChatRead` (read) / `ChatMarkedUnread` | badge cleared / one unread |
+| `ClearChatUpdate` (app-state `clearChat`) | `ChatCleared { keep_starred }` | messages removed (starred kept when asked), the chat stays |
+| `DeleteChatUpdate` (app-state `deleteChat`) | `ChatDeleted` | chat and messages removed, closed if open |
 | `IncomingCall`, `MissedCall`, `CallEndedElsewhere` | `Call(CallSignal)` | call panel, ringtone, call bubbles (§8) |
 
 Reactions, edits and "delete for me" events wait until the message batch that
@@ -112,7 +114,27 @@ click jumps to the original, loading the cache around it when needed.
 | Group info drawer | `groups().get_metadata` (description, participants with admin type) | when the drawer opens |
 | Groups in common | `groups().get_participating`, filtered by the contact's PN / LID | when the drawer opens |
 | Block / unblock | `blocking().block / unblock`, `blocking().is_blocked` | after a confirmation in the drawer |
-| Mute / unmute | `chat_actions().mute_chat` (indefinite) / `unmute_chat` | optimistic, reverted on failure; mute durations other than "always" are not offered yet |
+| Mute / unmute | `chat_actions().mute_chat_until` (8 hours, 1 week) / `mute_chat` (always) / `unmute_chat` | optimistic, reverted on failure; the end is kept (`chats.mute_end`, schema 7, Unix seconds, `-1` = always) and a timed mute ends on its own. Sync actions carry the end in milliseconds |
+| Mark as read / unread | `chat_actions().mark_chat_as_read` with the newest message as `messageRange` | optimistic, reverted on failure; reading a chat that was marked unread by hand (here or on the phone, since start-up) also sends `read = true` |
+| Clear chat | `chat_actions().clear_chat(deleteStarred = !keep, deleteMedia = false)` | asks first ("Keep starred messages" ticked by default); sent first, applied here once the phone has it |
+| Delete chat | `chat_actions().delete_chat(deleteMedia = false)` | asks first; sent first, applied once the phone has it; list memberships are left to the phone |
+| Send video / GIF | `Client::upload(MediaType::Video)` + `VideoMessage` (`seconds`, `width`, `height`, `jpegThumbnail`, `gifPlayback` for GIFs) | only `.mp4` / `.m4v` go as videos: the `ferrochat-player` helper reads the size, duration and first frame (muted, then stopped) before the preview opens; a file it can't read goes as a document with a note. A `.gif` is converted to a silent H.264 Baseline MP4 by the helper (`--gif-to-mp4`: frames composited by `image`, own delays kept, transparency on white, ≤ 640 px with even sides, ≤ 60 s / 1500 frames) and sent with `gifPlayback`, like WhatsApp. Received `gifPlayback` videos show "GIF" instead of a duration and loop in the viewer (`Content::Video::gif`, serde default, no schema change). Other containers (`.mov`, `.webm`, `.mkv`) stay documents |
+| Re-upload expired media | `media_reupload().request(MediaReuploadRequest)` (the "media retry" receipt; `participant` only for others' group messages) | a download answered 404 / 410 by the CDN (`Error::MediaExpired`, typical for old history) asks the sender's phone to upload the blob again, points the cached message at the new `directPath` (`Store::set_media_ref`) and tries once more; `NotFound` / errors leave the placeholder with "no longer available". Applies to photos, videos, voice notes, documents and posters, not to statuses |
+| Forward | `send_message_with_options` with the body rebuilt from the cached content and passed through `MessageExt::prepare_for_forward` (`convert::build_forward`) | up to 5 chats (1 when "forwarded many times"); each copy is a new message with our own id, shown and cached at once and sent in order. Media is relayed from the same CDN blob (`directPath`, `mediaKey`, hashes; `url` built on `mmg.whatsapp.net`), never re-uploaded by us; media older than 14 days (`forward::STALE_MEDIA_SECS`) is first refreshed with one re-upload request per source (best effort: on failure the old blob is relayed). Quote, mentions and `messageSecret` are dropped like the official client. Not offered for deleted, view-once, unsupported, call or media without a key, nor for our own pending / failed messages |
+
+Message info: the menu of our own messages opens a "Message info" panel
+(`app/msg_info.rs`, `ui/msg_info.rs`) with sent / delivered / read / played
+times, and in groups who has read it and who has only received it. Times
+come from the receipts seen arriving (`receipt_times`, schema 9: one row per
+message, participant and status, first time kept; only our messages). Older
+messages, and receipts that arrived while Ferrochat was closed, show the
+status without a time ("Time not recorded").
+
+Forwarded mark: `contextInfo.isForwarded` / `forwardingScore` is kept per
+message (cache column `forwarded`, schema 8: the score, NULL = not
+forwarded) and shown as "Forwarded", or "Forwarded many times" with a double
+arrow from score 5 (the library jumps to the 127 sentinel there). A forward
+of a forward carries the source score plus one.
 
 Mentions: `contextInfo.mentionedJid` is kept per message (cache column
 `mentions`, schema 6). An "@<digits>" in the text is shown as the name of
@@ -414,15 +436,15 @@ decodes in-process (memory cannot be given back by closing the viewer).
   normalised to the PN JID. A LID seen before any mapping is learned still
   forms its own chat until the pair arrives (existing rows are not merged
   retroactively).
-* Group "read" ticks turn blue on the first participant's read receipt
-  (WhatsApp waits for all participants).
 * Videos that arrive without `jpegThumbnail` (seen on history-synced media;
   the library's default `HistorySyncConfig` does not ask for
   `thumbnailSyncDaysLimit`) get a poster frame from the helper when they are
   at most 16 MB; bigger ones keep the placeholder until played.
 * The info drawer has no "disappearing messages", encryption code,
   "report" or "exit group" actions, and media visibility / per-chat
-  wallpaper are not offered; mute is "always" only.
+  wallpaper are not offered.
+* "Mark as read" from the chat menu syncs the read state to the other
+  devices but sends no read receipts to the sender.
 * Windows and macOS have no tray yet (stub): closing the window quits.
 * On Wayland the compositor may refuse to focus a window that is shown from
   the tray or a notification (xdg-activation); it then appears without focus.

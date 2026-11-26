@@ -292,7 +292,7 @@ The app updates itself from GitHub Releases (`src/update/`, glue in
 
 | Piece | Where |
 |---|---|
-| One `GET https://api.github.com/repos/FerroApps/Ferrochat/releases/latest` (`Accept: application/vnd.github+json`, `User-Agent: ferrochat/<version>`, `If-None-Match`), no account data, telemetry or machine id. `FERRO_RELEASE_API` overrides the URL (HTTPS GitHub, or plain HTTP on loopback for tests) | `update/http.rs` |
+| One `GET https://api.github.com/repos/Kartudev/Ferrochat-kartu/releases/latest` (`Accept: application/vnd.github+json`, `User-Agent: ferrochat/<version>`, `If-None-Match`), no account data, telemetry or machine id. `FERRO_RELEASE_API` overrides the URL (HTTPS GitHub, or plain HTTP on loopback for tests) | `update/http.rs` |
 | Strict `X.Y.Z` compare against `CARGO_PKG_VERSION`; drafts, prereleases and odd tags ignored | `update/version.rs`, `update/release.rs` |
 | Schedule: 10-20 s after start, then every 6 h ± 30 min, also while hidden in the tray; 403/429 back off silently (`Retry-After` / `X-RateLimit-Reset`, max 24 h). Never in `--mock`, `--screenshot` or debug builds unless `FERRO_UPDATE_FORCE=1`. "Check for updates automatically" (`check_updates` in `settings.json`, default on) stops the timer; the manual check still works | `update/schedule.rs`, `app/updates.rs` |
 | Dismissed version, last ETag and the release it described | `$XDG_STATE_HOME/ferrochat/update.json` (not written in `--mock`) |
@@ -314,7 +314,7 @@ Install methods (`update/method.rs`, pure `detect` over a `Probe` of
    `installed-version` are rewritten exactly as install.sh does. Leftovers of
    a killed update are removed by the next one.
 2. **cargo install** (`${CARGO_HOME:-~/.cargo}/bin`): never self-updates; the
-   banner shows `cargo install --git https://github.com/FerroApps/Ferrochat --locked --force`
+   banner shows `cargo install --git https://github.com/Kartudev/Ferrochat-kartu --locked --force`
    with a copy button.
 3. **Anything else** (cargo `target/` dir, `/usr`, `/opt`, Flatpak / AppImage /
    Snap, read-only folder): notify only, with a button that opens the release

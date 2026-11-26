@@ -297,6 +297,7 @@ impl App {
             expires_at: None,
             reply: None,
             edited: false,
+            forwarded: None,
             mentions: Vec::new(),
             reactions: Vec::new(),
         };
@@ -339,6 +340,7 @@ pub(super) fn scene(chat: &str, active: bool) -> Vec<Task<Message>> {
         expires_at: None,
         reply: None,
         edited: false,
+        forwarded: None,
         mentions: Vec::new(),
         reactions: Vec::new(),
     };

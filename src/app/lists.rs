@@ -145,7 +145,7 @@ impl App {
                 Task::none()
             }
             Ui::OpenLink(href) => self.open_link(href),
-            other => return Err(other),
+            other => return self.on_ui_chat_actions(other),
         })
     }
 
