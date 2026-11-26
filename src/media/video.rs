@@ -138,6 +138,12 @@ pub fn helper_path() -> Option<PathBuf> {
         if let Some(p) = dir.parent().and_then(helper_in) {
             return Some(p);
         }
+        // Newer Cargo (build-dir layout, Rust 1.100+) runs unit tests from
+        // target/debug/build/<pkg>/<hash>/out: the helper is a few levels up.
+        #[cfg(test)]
+        if let Some(p) = dir.ancestors().skip(2).take(4).find_map(helper_in) {
+            return Some(p);
+        }
     }
     let path = std::env::var_os("PATH")?;
     std::env::split_paths(&path)
