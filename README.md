@@ -60,8 +60,8 @@ Uninstall (program folder, shortcut and "start at login" only):
 
 Or download `ferrochat-vX.Y.Z-windows-x86_64.zip`, check it against its
 `.sha256` (`Get-FileHash`), unpack it anywhere you can write to and run
-`ferrochat.exe`. That folder updates itself too. On Windows there is no tray
-icon yet: closing the window quits.
+`ferrochat.exe`. That folder updates itself too. Closing the window keeps
+Ferrochat in the notification area (tray icon), like on Linux.
 
 Ferrochat checks for a new release when it starts and every few hours, and
 shows a slim banner when one is out. Installs made with `install.sh` (or the

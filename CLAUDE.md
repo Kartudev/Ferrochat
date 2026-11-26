@@ -57,7 +57,11 @@ Wayland `app_id` / desktop entry id: `dev.ferro.ferrochat` (`packaging/`).
   `clean_leftovers` deletes them on the next start. Sync staged files through a WRITE handle.
 - Release builds use `windows_subsystem = "windows"`; children (helper) get `CREATE_NO_WINDOW`.
 - Autostart = HKCU Run value `Ferrochat` (`autostart::windows`); single instance = loopback TCP port in
-  `<data_dir>/ferrochat.port`. Tray is still a stub on Windows (close quits).
+  `<data_dir>/ferrochat.port`.
+- Tray (`tray/windows.rs`): raw `Shell_NotifyIconW` on its own thread with a hidden window + message
+  loop; model updates are posted (`WM_REFRESH`), re-added on `TaskbarCreated`, removed by
+  `tray::shutdown()` at quit. Exe icon: `packaging/ferrochat.ico` (generated, `icon::tests`) embedded
+  by `build.rs` (embed-resource) only for Windows targets.
 
 ## Gotchas
 - Only ONE `libsqlite3-sys` may link: it is pinned to 0.37 with `bundled-sqlcipher`;

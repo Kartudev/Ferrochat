@@ -1,0 +1,3 @@
+// Windows resources of ferrochat.exe (built by build.rs on Windows only).
+// The icon is generated from assets/ferrochat.svg (see icon::tests).
+1 ICON "ferrochat.ico"

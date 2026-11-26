@@ -1,4 +1,4 @@
-//! Windows / macOS: the tray is not implemented. The app reports "no tray",
+//! macOS: the tray is not implemented. The app reports "no tray",
 //! so closing the window quits as before.
 
 use super::TrayModel;
