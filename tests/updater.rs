@@ -184,6 +184,7 @@ fn old_install(name: &str) -> (PathBuf, ScriptLayout) {
     let layout = ScriptLayout {
         bin_dir: root.join("bin"),
         data_dir: root.join("share"),
+        windows: false,
     };
     std::fs::create_dir_all(&layout.bin_dir).unwrap();
     std::fs::write(layout.bin("ferrochat"), b"OLD-APP").unwrap();
@@ -394,4 +395,164 @@ fn redirects_are_checked_against_the_allowlist() {
         )
         .is_err()
     );
+}
+
+// --- Windows folder install (the release .zip) ------------------------------
+// Pure file operations, so it runs on every platform; on Windows CI the old
+// `ferrochat.exe` is a running process while it is replaced.
+
+fn zip_name() -> String {
+    format!("ferrochat-v{VERSION}-windows-x86_64.zip")
+}
+
+/// A release zip laid out like release.yml packages it.
+fn release_zip() -> Vec<u8> {
+    use std::io::Write as _;
+    let top = format!("ferrochat-v{VERSION}-windows-x86_64");
+    let mut z = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    let opts = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
+    for (path, data) in [
+        ("ferrochat.exe", &b"NEW-APP"[..]),
+        ("ferrochat-player.exe", b"NEW-PLAYER"),
+        ("installed-version", b"9.0.0\n"),
+        ("README.md", b"readme"),
+        ("licenses/OpenH264-BSD-2-Clause.txt", b"bsd"),
+    ] {
+        z.start_file(format!("{top}/{path}"), opts).unwrap();
+        z.write_all(data).unwrap();
+    }
+    z.finish().unwrap().into_inner()
+}
+
+fn serve_zip_release(sum: &str) -> Server {
+    let s = Server::start();
+    let name = zip_name();
+    let base = s.base.clone();
+    s.route(
+        "/latest",
+        200,
+        &[],
+        format!(
+            r#"{{"tag_name":"v{VERSION}","draft":false,"prerelease":false,
+            "html_url":"https://github.com/Kartudev/Ferrochat-kartu/releases/tag/v{VERSION}",
+            "assets":[
+              {{"name":"{name}","browser_download_url":"{base}/dl/{name}","size":0}},
+              {{"name":"{name}.sha256","browser_download_url":"{base}/dl/{name}.sha256","size":0}}
+            ]}}"#
+        )
+        .into_bytes(),
+    );
+    s.route(&format!("/dl/{name}"), 200, &[], release_zip());
+    s.route(
+        &format!("/dl/{name}.sha256"),
+        200,
+        &[],
+        format!("{sum}  {name}\n").into_bytes(),
+    );
+    s
+}
+
+/// Keeps a copy of this test binary running from `exe` (it runs the ignored
+/// `sleeper` test), like the app that installs its own update.
+struct Running(std::process::Child);
+
+impl Running {
+    fn start(exe: &Path) -> Self {
+        std::fs::copy(std::env::current_exe().unwrap(), exe).unwrap();
+        let child = std::process::Command::new(exe)
+            .args(["--ignored", "--exact", "sleeper", "--nocapture"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        Self(child)
+    }
+}
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+#[test]
+#[ignore = "helper process for the Windows install test"]
+fn sleeper() {
+    std::thread::sleep(Duration::from_secs(60));
+}
+
+#[test]
+fn installs_the_windows_zip_over_a_running_program() {
+    let s = serve_zip_release(&sha256_hex(&release_zip()));
+    let root = temp("win");
+    let layout = ScriptLayout::windows(root.clone());
+    let running = Running::start(&layout.bin("ferrochat"));
+    std::fs::write(layout.bin("ferrochat-player"), b"OLD-PLAYER").unwrap();
+    std::fs::write(layout.version_file(), "0.1.0\n").unwrap();
+
+    let CheckOutcome::Fresh {
+        release: Some(r), ..
+    } = check(&s, "/latest", None).unwrap()
+    else {
+        panic!("no release");
+    };
+    let package = select_package(&r, Platform::WindowsX86_64).unwrap();
+    let (_, policy) = http::endpoint_for(&format!("{}/latest", s.base)).unwrap();
+    install::install(
+        &layout,
+        &package,
+        &policy,
+        &AtomicBool::new(false),
+        &mut |_| {},
+    )
+    .unwrap();
+    assert_eq!(std::fs::read(layout.bin("ferrochat")).unwrap(), b"NEW-APP");
+    assert_eq!(
+        std::fs::read(layout.bin("ferrochat-player")).unwrap(),
+        b"NEW-PLAYER"
+    );
+    assert_eq!(
+        std::fs::read_to_string(layout.version_file()).unwrap(),
+        "9.0.0\n"
+    );
+    // The running program could only be moved aside (Windows); once it has
+    // exited, the next start removes it.
+    drop(running);
+    install::clean_leftovers(&root);
+    assert!(
+        hidden_files(&root).is_empty(),
+        "left: {:?}",
+        hidden_files(&root)
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn a_corrupt_windows_zip_changes_nothing() {
+    let s = serve_zip_release(&"0".repeat(64));
+    let root = temp("win-corrupt");
+    let layout = ScriptLayout::windows(root.clone());
+    std::fs::write(layout.bin("ferrochat"), b"OLD-APP").unwrap();
+    let CheckOutcome::Fresh {
+        release: Some(r), ..
+    } = check(&s, "/latest", None).unwrap()
+    else {
+        panic!("no release");
+    };
+    let package = select_package(&r, Platform::WindowsX86_64).unwrap();
+    let (_, policy) = http::endpoint_for(&format!("{}/latest", s.base)).unwrap();
+    let r = install::install(
+        &layout,
+        &package,
+        &policy,
+        &AtomicBool::new(false),
+        &mut |_| {},
+    );
+    assert!(matches!(r, Err(InstallError::Failed(m)) if m.contains("checksum")));
+    assert_eq!(std::fs::read(layout.bin("ferrochat")).unwrap(), b"OLD-APP");
+    assert!(hidden_files(&root).is_empty());
+    let _ = std::fs::remove_dir_all(root);
 }

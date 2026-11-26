@@ -7,23 +7,49 @@ use std::path::{Path, PathBuf};
 
 use super::CRATE;
 
-/// Where the files of an `install.sh` install live (same paths as the script).
+/// Where the files of an `install.sh` install live (same paths as the script),
+/// or, on Windows, the folder of an unpacked release `.zip` (`install.ps1`
+/// unpacks it to `%LOCALAPPDATA%\Programs\Ferrochat`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScriptLayout {
-    /// `${XDG_BIN_HOME:-~/.local/bin}`.
+    /// `${XDG_BIN_HOME:-~/.local/bin}`; on Windows the app's folder.
     pub bin_dir: PathBuf,
-    /// `${XDG_DATA_HOME:-~/.local/share}`.
+    /// `${XDG_DATA_HOME:-~/.local/share}`; on Windows the app's folder.
     pub data_dir: PathBuf,
+    /// A Windows folder install: `.exe` names, the version marker next to
+    /// the program, no desktop entry or icon, and the running program is
+    /// moved aside instead of overwritten.
+    pub windows: bool,
 }
 
+/// Name of the version marker (install.sh: under the data dir; Windows:
+/// next to `ferrochat.exe`, shipped in the zip).
+pub const VERSION_MARKER: &str = "installed-version";
+
 impl ScriptLayout {
-    /// `<bin_dir>/<name>`.
-    pub fn bin(&self, name: &str) -> PathBuf {
-        self.bin_dir.join(name)
+    /// The layout of a Windows folder install in `dir`.
+    pub fn windows(dir: PathBuf) -> Self {
+        Self {
+            bin_dir: dir.clone(),
+            data_dir: dir,
+            windows: true,
+        }
     }
-    /// `<data_dir>/<crate>/installed-version`.
+    /// `<bin_dir>/<name>` (`<name>.exe` for a Windows install).
+    pub fn bin(&self, name: &str) -> PathBuf {
+        if self.windows {
+            self.bin_dir.join(format!("{name}.exe"))
+        } else {
+            self.bin_dir.join(name)
+        }
+    }
+    /// `<data_dir>/<crate>/installed-version` (Windows: `<dir>/installed-version`).
     pub fn version_file(&self) -> PathBuf {
-        self.data_dir.join(CRATE).join("installed-version")
+        if self.windows {
+            self.bin_dir.join(VERSION_MARKER)
+        } else {
+            self.data_dir.join(CRATE).join(VERSION_MARKER)
+        }
     }
     /// `<data_dir>/applications`.
     pub fn apps_dir(&self) -> PathBuf {
@@ -106,6 +132,12 @@ pub struct Probe {
     pub cargo_bin_dir: Option<PathBuf>,
     /// Flatpak / AppImage / Snap environment.
     pub sandboxed: bool,
+    /// Windows build: the folder of the program is the install.
+    pub windows: bool,
+    /// Windows: `installed-version` sits next to the program.
+    pub exe_dir_marker: bool,
+    /// Windows: the program's folder looks writable.
+    pub exe_dir_writable: bool,
 }
 
 /// Decides the install method from a probe.
@@ -119,6 +151,9 @@ pub fn detect(p: &Probe) -> InstallMethod {
     if is_cargo_target(exe) {
         return InstallMethod::Unmanaged(Unmanaged::DevBuild);
     }
+    if p.windows {
+        return detect_windows(p, exe);
+    }
     if let (Some(bin), Some(data)) = (&p.script_bin_dir, &p.script_data_dir)
         && exe == bin.join(CRATE)
         && p.version_marker
@@ -127,6 +162,7 @@ pub fn detect(p: &Probe) -> InstallMethod {
             InstallMethod::Script(ScriptLayout {
                 bin_dir: bin.clone(),
                 data_dir: data.clone(),
+                windows: false,
             })
         } else {
             InstallMethod::Unmanaged(Unmanaged::ReadOnly)
@@ -143,6 +179,47 @@ pub fn detect(p: &Probe) -> InstallMethod {
         return InstallMethod::Unmanaged(Unmanaged::System);
     }
     InstallMethod::Unmanaged(Unmanaged::Unknown)
+}
+
+/// Windows: a folder with `ferrochat.exe` and the shipped version marker
+/// updates itself (the release zip and install.ps1 both leave one); a
+/// cargo install gets the command; anything else only the release page.
+fn detect_windows(p: &Probe, exe: &Path) -> InstallMethod {
+    let named = exe
+        .file_name()
+        .is_some_and(|n| n.eq_ignore_ascii_case(format!("{CRATE}.exe").as_str()));
+    if p.cargo_bin_dir
+        .as_deref()
+        .is_some_and(|c| exe.parent() == Some(c))
+    {
+        return InstallMethod::Cargo;
+    }
+    match exe.parent() {
+        Some(dir) if named && p.exe_dir_marker => {
+            if p.exe_dir_writable {
+                InstallMethod::Script(ScriptLayout::windows(dir.to_path_buf()))
+            } else {
+                InstallMethod::Unmanaged(Unmanaged::ReadOnly)
+            }
+        }
+        _ => InstallMethod::Unmanaged(Unmanaged::Unknown),
+    }
+}
+
+/// Whether a folder accepts new files: creates and removes a probe file.
+/// Windows' read-only attribute says nothing about folder ACLs (Program
+/// Files is "writable" by attribute and still refuses a normal user).
+fn dir_accepts_files(dir: &Path) -> bool {
+    let probe = dir.join(format!(".{CRATE}-write-test.{}", std::process::id()));
+    let ok = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)
+        .is_ok();
+    if ok {
+        let _ = std::fs::remove_file(&probe);
+    }
+    ok
 }
 
 /// `.../target/<profile>/<exe>` (also `deps/` and target triples).
@@ -176,9 +253,17 @@ pub fn script_dirs() -> Option<(PathBuf, PathBuf)> {
     Some((bin, data))
 }
 
-/// Reads the environment. Cheap: a few `stat`s, no writes.
+/// Reads the environment. Cheap: a few `stat`s (on Windows, one probe file
+/// in the program's folder when it carries the version marker).
 pub fn probe() -> Probe {
     let exe = std::env::current_exe().ok().map(canonical);
+    let windows = cfg!(windows);
+    let exe_dir = exe.as_deref().and_then(Path::parent).map(Path::to_path_buf);
+    let exe_dir_marker = windows
+        && exe_dir
+            .as_ref()
+            .is_some_and(|d| d.join(VERSION_MARKER).is_file());
+    let exe_dir_writable = exe_dir_marker && exe_dir.as_deref().is_some_and(dir_accepts_files);
     let (bin, data) = match script_dirs() {
         Some((b, d)) => (Some(canonical(b)), Some(d)),
         None => (None, None),
@@ -192,6 +277,7 @@ pub fn probe() -> Probe {
         .is_some_and(|m| m.is_dir() && !m.permissions().readonly());
     let cargo_bin_dir = env_dir("CARGO_HOME")
         .or_else(|| env_dir("HOME").map(|h| h.join(".cargo")))
+        .or_else(|| env_dir("USERPROFILE").map(|h| h.join(".cargo")))
         .map(|c| canonical(c.join("bin")));
     let sandboxed = ["FLATPAK_ID", "APPIMAGE", "SNAP"]
         .iter()
@@ -205,6 +291,9 @@ pub fn probe() -> Probe {
         bin_dir_writable,
         cargo_bin_dir,
         sandboxed,
+        windows,
+        exe_dir_marker,
+        exe_dir_writable,
     }
 }
 
@@ -221,7 +310,54 @@ mod tests {
             bin_dir_writable: true,
             cargo_bin_dir: Some("/home/u/.cargo/bin".into()),
             sandboxed: false,
+            windows: false,
+            exe_dir_marker: false,
+            exe_dir_writable: false,
         }
+    }
+
+    fn windows_probe() -> Probe {
+        Probe {
+            exe: Some("C:/Users/u/AppData/Local/Programs/Ferrochat/ferrochat.exe".into()),
+            cargo_bin_dir: Some("C:/Users/u/.cargo/bin".into()),
+            windows: true,
+            exe_dir_marker: true,
+            exe_dir_writable: true,
+            ..Probe::default()
+        }
+    }
+
+    #[test]
+    fn windows_folder_install_self_updates() {
+        let m = detect(&windows_probe());
+        let InstallMethod::Script(l) = &m else {
+            panic!("{m:?}")
+        };
+        assert!(l.windows);
+        let dir = Path::new("C:/Users/u/AppData/Local/Programs/Ferrochat");
+        assert_eq!(l.bin_dir, dir);
+        assert_eq!(l.bin("ferrochat"), dir.join("ferrochat.exe"));
+        assert_eq!(l.bin("ferrochat-player"), dir.join("ferrochat-player.exe"));
+        assert_eq!(l.version_file(), dir.join("installed-version"));
+    }
+
+    #[test]
+    fn windows_needs_the_marker_a_writable_folder_and_the_right_name() {
+        let mut p = windows_probe();
+        p.exe_dir_marker = false;
+        assert_eq!(detect(&p), InstallMethod::Unmanaged(Unmanaged::Unknown));
+        let mut p = windows_probe();
+        p.exe_dir_writable = false;
+        assert_eq!(detect(&p), InstallMethod::Unmanaged(Unmanaged::ReadOnly));
+        let mut p = windows_probe();
+        p.exe = Some("C:/Apps/Ferrochat/other.exe".into());
+        assert_eq!(detect(&p), InstallMethod::Unmanaged(Unmanaged::Unknown));
+        let mut p = windows_probe();
+        p.exe = Some("C:/Users/u/.cargo/bin/ferrochat.exe".into());
+        assert_eq!(detect(&p), InstallMethod::Cargo);
+        let mut p = windows_probe();
+        p.exe = Some("C:/src/Ferrochat/target/release/ferrochat.exe".into());
+        assert_eq!(detect(&p), InstallMethod::Unmanaged(Unmanaged::DevBuild));
     }
 
     #[test]

@@ -102,6 +102,8 @@ pub fn latest_page() -> String {
 pub enum Platform {
     /// `<crate>-v<ver>-linux-x86_64.tar.gz`.
     LinuxX86_64,
+    /// `<crate>-v<ver>-windows-x86_64.zip`.
+    WindowsX86_64,
     /// No release asset exists for this platform.
     Other,
 }
@@ -111,6 +113,8 @@ impl Platform {
     pub const fn current() -> Self {
         if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
             Self::LinuxX86_64
+        } else if cfg!(all(windows, target_arch = "x86_64")) {
+            Self::WindowsX86_64
         } else {
             Self::Other
         }
@@ -121,6 +125,7 @@ impl Platform {
 pub fn archive_name(platform: Platform, version: Version) -> Option<String> {
     match platform {
         Platform::LinuxX86_64 => Some(format!("{CRATE}-v{version}-linux-x86_64.tar.gz")),
+        Platform::WindowsX86_64 => Some(format!("{CRATE}-v{version}-windows-x86_64.zip")),
         Platform::Other => None,
     }
 }
@@ -159,7 +164,9 @@ mod tests {
             "body":"notes","assets":[
               {{"name":"ferrochat-v9.1.0-linux-x86_64.tar.gz","browser_download_url":"https://github.com/Kartudev/Ferrochat-kartu/releases/download/v9.1.0/ferrochat-v9.1.0-linux-x86_64.tar.gz","size":123}},
               {{"name":"ferrochat-v9.1.0-linux-x86_64.tar.gz.sha256","browser_download_url":"https://github.com/Kartudev/Ferrochat-kartu/releases/download/v9.1.0/ferrochat-v9.1.0-linux-x86_64.tar.gz.sha256","size":99}},
-              {{"name":"ferrochat-v9.1.0-linux-x86_64.tar.gz.sig","browser_download_url":"https://example.com/x","size":1}}
+              {{"name":"ferrochat-v9.1.0-linux-x86_64.tar.gz.sig","browser_download_url":"https://example.com/x","size":1}},
+              {{"name":"ferrochat-v9.1.0-windows-x86_64.zip","browser_download_url":"https://github.com/Kartudev/Ferrochat-kartu/releases/download/v9.1.0/ferrochat-v9.1.0-windows-x86_64.zip","size":456}},
+              {{"name":"ferrochat-v9.1.0-windows-x86_64.zip.sha256","browser_download_url":"https://github.com/Kartudev/Ferrochat-kartu/releases/download/v9.1.0/ferrochat-v9.1.0-windows-x86_64.zip.sha256","size":99}}
             ]}}"#
         )
     }
@@ -174,7 +181,7 @@ mod tests {
             r.html_url,
             "https://github.com/Kartudev/Ferrochat-kartu/releases/tag/v9.1.0"
         );
-        assert_eq!(r.assets.len(), 3);
+        assert_eq!(r.assets.len(), 5);
         assert_eq!(r.assets[0].size, 123);
     }
 
@@ -219,6 +226,20 @@ mod tests {
             "ferrochat-v9.1.0-linux-x86_64.tar.gz.sha256"
         );
         assert_eq!(select_package(&r, Platform::Other), None);
+    }
+
+    #[test]
+    fn selects_the_windows_zip_and_checksum() {
+        let r = parse_release(body("v9.1.0", false, false).as_bytes())
+            .unwrap()
+            .unwrap();
+        let p = select_package(&r, Platform::WindowsX86_64).unwrap();
+        assert_eq!(p.archive.name, "ferrochat-v9.1.0-windows-x86_64.zip");
+        assert_eq!(p.archive.size, 456);
+        assert_eq!(
+            p.checksum.name,
+            "ferrochat-v9.1.0-windows-x86_64.zip.sha256"
+        );
     }
 
     #[test]
