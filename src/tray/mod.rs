@@ -1,9 +1,10 @@
-//! System tray icon (StatusNotifierItem on Linux).
+//! System tray icon (StatusNotifierItem on Linux, the notification area on
+//! Windows).
 //!
 //! The pure parts (what the tooltip says, which status, which menu entries
 //! and what they do) live here and are unit-tested. The D-Bus service is in
-//! `linux.rs`; Windows and macOS get a stub that reports "no tray" (not
-//! implemented), so the app there closes to quit as before.
+//! `linux.rs`, the Win32 one in `windows.rs`; macOS gets a stub that reports
+//! "no tray" (not implemented), so the app there closes to quit as before.
 
 use std::sync::OnceLock;
 
@@ -11,13 +12,22 @@ use tokio::sync::watch;
 
 #[cfg(target_os = "linux")]
 mod linux;
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", windows)))]
 mod stub;
+#[cfg(windows)]
+mod windows;
 
 #[cfg(target_os = "linux")]
 pub use linux::start;
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", windows)))]
 pub use stub::start;
+#[cfg(windows)]
+pub use windows::{shutdown, start};
+
+/// Removes the tray icon at quit (only Windows needs it: the D-Bus service
+/// goes away with the process).
+#[cfg(not(windows))]
+pub fn shutdown() {}
 
 /// What a tray click or menu entry asks for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

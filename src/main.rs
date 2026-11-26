@@ -111,6 +111,7 @@ fn main() -> iced::Result {
         .default_font(theme::INTER)
         .antialiasing(true)
         .run();
+    ferrochat::tray::shutdown();
     if !mock {
         ferrochat::instance::cleanup(&data_dir);
     }
