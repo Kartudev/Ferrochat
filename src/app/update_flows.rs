@@ -103,7 +103,7 @@ async fn settings_check_finds_an_update() {
     let mut h = Harness::new().await;
     let v = newer();
     let url = serve_once(format!(
-        r#"{{"tag_name":"v{v}","html_url":"https://github.com/FerroApps/Ferrochat/releases/tag/v{v}","assets":[]}}"#
+        r#"{{"tag_name":"v{v}","html_url":"https://github.com/Kartudev/Ferrochat-kartu/releases/tag/v{v}","assets":[]}}"#
     ));
     h.app.updater.api = endpoint_for(&url);
     h.app.updater.check = CheckState::Idle;

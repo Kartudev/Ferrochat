@@ -276,7 +276,7 @@ mod tests {
         p.exe = Some("/opt/cargo/bin/ferrochat".into());
         p.cargo_bin_dir = Some("/opt/cargo/bin".into());
         assert_eq!(detect(&p), InstallMethod::Cargo);
-        assert!(cargo_command().ends_with("FerroApps/Ferrochat --locked --force"));
+        assert!(cargo_command().ends_with("Kartudev/Ferrochat-kartu --locked --force"));
     }
 
     #[test]
